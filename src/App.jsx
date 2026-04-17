@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 
 const POLL_INTERVAL = 8000;
+const MAX_AUTO_RETRIES = 3;
 
 const font = `'DM Sans', sans-serif`;
 const mono = `'JetBrains Mono', 'Fira Code', monospace`;
@@ -21,13 +22,61 @@ function fileToPreview(file) {
   });
 }
 
-function StatusBadge({ status }) {
+// Convert image to a different format (PNG↔JPG) via canvas
+function convertImageFormat(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      // Toggle format: if PNG → JPG, else → PNG
+      const isPng = file.type === "image/png" || file.name.toLowerCase().endsWith(".png");
+      const newType = isPng ? "image/jpeg" : "image/png";
+      const newExt = isPng ? ".jpg" : ".png";
+      const baseName = file.name.replace(/\.\w+$/, "");
+      const newName = baseName + "_v2" + newExt;
+      canvas.toBlob((blob) => {
+        resolve(new File([blob], newName, { type: newType }));
+      }, newType, 0.92);
+    };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// Resize image to 95% via canvas (changes pixel data)
+function resizeImage(file, scale) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const isPng = file.type === "image/png" || file.name.toLowerCase().endsWith(".png");
+      const type = isPng ? "image/png" : "image/jpeg";
+      const ext = isPng ? ".png" : ".jpg";
+      const baseName = file.name.replace(/\.\w+$/, "");
+      const newName = baseName + "_v3" + ext;
+      canvas.toBlob((blob) => {
+        resolve(new File([blob], newName, { type }));
+      }, type, 0.92);
+    };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function StatusBadge({ status, retries }) {
   const m = {
     pending: { color: c.muted, label: "Pending" },
     uploading: { color: c.warn, label: "Uploading" },
     processing: { color: c.accent, label: "Processing" },
     completed: { color: c.success, label: "Done" },
     failed: { color: c.error, label: "Failed" },
+    retrying: { color: c.warn, label: `Auto-retry ${retries}/${MAX_AUTO_RETRIES}` },
   };
   const s = m[status] || m.pending;
   return (
@@ -39,7 +88,7 @@ function StatusBadge({ status }) {
       <span style={{
         width: 5, height: 5, borderRadius: "50%", background: s.color,
         boxShadow: status === "processing" ? `0 0 6px ${s.color}` : "none",
-        animation: status === "processing" || status === "uploading" ? "pulse 1.5s infinite" : "none",
+        animation: (status === "processing" || status === "uploading" || status === "retrying") ? "pulse 1.5s infinite" : "none",
       }} />
       {s.label}
     </span>
@@ -49,8 +98,8 @@ function StatusBadge({ status }) {
 export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [connected, setConnected] = useState(false);
-  const [refVideo, setRefVideo] = useState(null);
   const [refVideoName, setRefVideoName] = useState("");
+  const [videoDuration, setVideoDuration] = useState(10);
   const [images, setImages] = useState([]);
   const [mode, setMode] = useState("std");
   const [orientation, setOrientation] = useState("video");
@@ -65,7 +114,7 @@ export default function App() {
   const refVideoUrlRef = useRef("");
 
   const rate = mode === "std" ? 0.065 : 0.104;
-  const perVideo = rate * 10;
+  const perVideo = rate * videoDuration;
   const batchEst = perVideo * images.length;
 
   const handleImages = useCallback(async (e) => {
@@ -79,7 +128,7 @@ export default function App() {
 
   const removeImage = (i) => setImages((p) => p.filter((_, idx) => idx !== i));
 
-  // Upload file directly from browser to tmpfiles.org to avoid CORS and size limits
+  // Upload to tmpfiles.org (avoids CORS and size limits)
   async function uploadFile(file) {
     const fd = new FormData();
     fd.append("file", file);
@@ -136,12 +185,24 @@ export default function App() {
     setJobs([...jobsRef.current]);
   }
 
-  // Submit a single job (used by start, retry, and replace-then-retry)
-  async function submitSingleJob(job, videoUrl) {
+  // Check if error is a content/NSFW filter failure (retryable)
+  function isContentFilterError(errorMsg) {
+    if (!errorMsg) return false;
+    const lower = errorMsg.toLowerCase();
+    return lower.includes("content violation") ||
+      lower.includes("nsfw") ||
+      lower.includes("deleted the task") ||
+      lower.includes("fetch task failed") ||
+      lower.includes("404 not found");
+  }
+
+  // Submit a single job — upload image and create task
+  async function submitSingleJob(job, videoUrl, fileOverride) {
     try {
       updateJob(job.id, { status: "uploading", error: null });
-      const imageUrl = job.imageUrl || await uploadFile(job.file);
-      if (!job.imageUrl) updateJob(job.id, { imageUrl });
+      const fileToUpload = fileOverride || job.file;
+      const imageUrl = await uploadFile(fileToUpload);
+      updateJob(job.id, { imageUrl });
       const taskId = await submitJob(imageUrl, videoUrl);
       updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
       return true;
@@ -149,6 +210,39 @@ export default function App() {
       updateJob(job.id, { status: "failed", error: err.message });
       return false;
     }
+  }
+
+  // Auto-retry logic: called when a content filter failure is detected
+  async function autoRetry(job, videoUrl) {
+    const retries = (job.retries || 0) + 1;
+    if (retries > MAX_AUTO_RETRIES) {
+      // All auto-retries exhausted — show as failed with manual options
+      updateJob(job.id, { status: "failed", retries });
+      return;
+    }
+
+    updateJob(job.id, { status: "retrying", retries, error: null });
+
+    // Small delay before retry
+    await new Promise((r) => setTimeout(r, 2000));
+
+    let fileToUpload = job.file;
+    try {
+      if (retries === 1) {
+        // Retry 1: same image, just re-upload with a fresh URL
+        // (tmpfiles gives a new URL each time)
+      } else if (retries === 2) {
+        // Retry 2: convert format (PNG↔JPG) and rename
+        fileToUpload = await convertImageFormat(job.file);
+      } else if (retries === 3) {
+        // Retry 3: resize to 95% and rename
+        fileToUpload = await resizeImage(job.file, 0.95);
+      }
+    } catch (_) {
+      // If conversion fails, just retry with original
+    }
+
+    await submitSingleJob(job, videoUrl, fileToUpload);
   }
 
   async function startBatch() {
@@ -159,7 +253,7 @@ export default function App() {
     const initial = images.map((img, i) => ({
       id: i, imageName: img.name, file: img.file, preview: img.preview,
       status: "uploading", taskId: null, videoUrl: null, imageUrl: null,
-      error: null,
+      error: null, retries: 0,
     }));
     jobsRef.current = initial;
     setJobs([...initial]);
@@ -170,58 +264,58 @@ export default function App() {
     startPolling();
   }
 
-  // Retry a single job with same image
+  // Manual retry — resets retry counter
   async function retryJob(jobId) {
     const job = jobsRef.current.find((j) => j.id === jobId);
     if (!job) return;
+    updateJob(jobId, { retries: 0 });
     const videoUrl = refVideoUrlRef.current;
-    if (!batchDone) {
-      // If batch polling is still active, just resubmit
-      await submitSingleJob(job, videoUrl);
-    } else {
-      // If batch ended, restart polling for this retry
+    if (batchDone) {
       setBatchDone(false);
       setRunning(true);
-      await submitSingleJob(job, videoUrl);
-      startPolling();
     }
+    await submitSingleJob(job, videoUrl);
+    if (!pollRef.current) startPolling();
   }
 
-  // Replace image on a failed job and retry
+  // Replace image and retry — resets retry counter
   async function replaceAndRetry(jobId, newFile) {
     const preview = await fileToPreview(newFile);
     updateJob(jobId, {
-      file: newFile,
-      imageName: newFile.name,
-      preview,
-      imageUrl: null, // Force re-upload
-      status: "uploading",
-      error: null,
+      file: newFile, imageName: newFile.name, preview,
+      imageUrl: null, retries: 0, status: "uploading", error: null,
     });
     const videoUrl = refVideoUrlRef.current;
     const job = jobsRef.current.find((j) => j.id === jobId);
-    if (!batchDone) {
-      await submitSingleJob(job, videoUrl);
-    } else {
+    if (batchDone) {
       setBatchDone(false);
       setRunning(true);
-      await submitSingleJob(job, videoUrl);
-      startPolling();
     }
+    await submitSingleJob(job, videoUrl);
+    if (!pollRef.current) startPolling();
   }
 
   function startPolling() {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
-      const processing = jobsRef.current.filter((j) => j.status === "processing");
-      if (processing.length === 0) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-        setRunning(false);
-        setBatchDone(true);
+      const active = jobsRef.current.filter(
+        (j) => j.status === "processing"
+      );
+      if (active.length === 0) {
+        // Check if anything is retrying — if so, keep polling
+        const retrying = jobsRef.current.filter((j) => j.status === "retrying" || j.status === "uploading");
+        if (retrying.length === 0) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setRunning(false);
+          setBatchDone(true);
+        }
         return;
       }
-      for (const job of processing) {
+
+      const videoUrl = refVideoUrlRef.current;
+
+      for (const job of active) {
         try {
           const data = await checkJob(job.taskId);
           if (data?.status === "completed") {
@@ -231,7 +325,15 @@ export default function App() {
             updateJob(job.id, { status: "completed", videoUrl: vUrl });
           } else if (data?.status === "failed") {
             const errMsg = data?.error?.raw_message || data?.error?.message || "Generation failed";
-            updateJob(job.id, { status: "failed", error: errMsg });
+            updateJob(job.id, { error: errMsg });
+
+            // If it's a content filter error, auto-retry
+            const currentJob = jobsRef.current.find((j) => j.id === job.id);
+            if (isContentFilterError(errMsg) && (currentJob?.retries || 0) < MAX_AUTO_RETRIES) {
+              await autoRetry(currentJob, videoUrl);
+            } else {
+              updateJob(job.id, { status: "failed" });
+            }
           }
         } catch (_) {}
       }
@@ -247,12 +349,13 @@ export default function App() {
     setBatchDone(false);
     setImages([]);
     setRefVideoName("");
+    setVideoDuration(10);
     refVideoUrlRef.current = "";
   }
 
   const completedCount = jobs.filter((j) => j.status === "completed").length;
   const processingCount = jobs.filter(
-    (j) => j.status === "processing" || j.status === "uploading"
+    (j) => j.status === "processing" || j.status === "uploading" || j.status === "retrying"
   ).length;
   const failedCount = jobs.filter((j) => j.status === "failed").length;
   const spent = completedCount * perVideo;
@@ -337,7 +440,21 @@ export default function App() {
                 type="text"
                 placeholder="Paste video URL"
                 value={refVideoName}
-                onChange={(e) => { setRefVideoName(e.target.value); refVideoUrlRef.current = e.target.value; }}
+                onChange={(e) => {
+                  const url = e.target.value;
+                  setRefVideoName(url);
+                  refVideoUrlRef.current = url;
+                  if (url && url.match(/^https?:\/\//)) {
+                    const v = document.createElement("video");
+                    v.preload = "metadata";
+                    v.onloadedmetadata = () => {
+                      if (v.duration && !isNaN(v.duration)) {
+                        setVideoDuration(Math.ceil(v.duration));
+                      }
+                    };
+                    v.src = url;
+                  }
+                }}
                 disabled={running}
                 style={{
                   background: c.surface, border: `1px solid ${refVideoName ? c.success : c.border}`, borderRadius: 5,
@@ -346,7 +463,7 @@ export default function App() {
                 }}
               />
               <div style={{ fontSize: 9, color: c.hint, lineHeight: 1.4 }}>
-                Upload your video to tmpfiles.org, streamable.com, or discord, then paste the direct URL here
+                Upload your video to tmpfiles.org or Discord, then paste the direct URL here
               </div>
             </div>
           </div>
@@ -448,7 +565,7 @@ export default function App() {
               Cost estimate
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
-              <span style={{ fontSize: 11, color: c.muted }}>Per video (10s)</span>
+              <span style={{ fontSize: 11, color: c.muted }}>Per video ({videoDuration}s)</span>
               <span style={{ fontSize: 11, fontFamily: mono }}>${perVideo.toFixed(2)}</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -538,22 +655,27 @@ export default function App() {
                       ) : (
                         <img src={job.preview} alt="" style={{
                           width: "100%", height: "100%", objectFit: "cover",
-                          opacity: (job.status === "processing" || job.status === "uploading") ? 0.4 : 0.7,
+                          opacity: (job.status === "processing" || job.status === "uploading" || job.status === "retrying") ? 0.4 : 0.7,
                         }} />
                       )}
-                      {(job.status === "processing" || job.status === "uploading") && (
+                      {(job.status === "processing" || job.status === "uploading" || job.status === "retrying") && (
                         <div style={{
                           position: "absolute", inset: 0,
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                          background: "rgba(0,0,0,0.35)",
+                          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                          background: "rgba(0,0,0,0.35)", gap: 6,
                         }}>
                           <div style={{
                             width: 24, height: 24,
-                            border: `2px solid ${c.accent}`,
+                            border: `2px solid ${job.status === "retrying" ? c.warn : c.accent}`,
                             borderTopColor: "transparent",
                             borderRadius: "50%",
                             animation: "spin 0.8s linear infinite",
                           }} />
+                          {job.status === "retrying" && (
+                            <div style={{ fontSize: 9, fontFamily: mono, color: c.warn, textTransform: "uppercase" }}>
+                              Auto-retry {job.retries}/{MAX_AUTO_RETRIES}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -567,10 +689,10 @@ export default function App() {
                           overflow: "hidden", textOverflow: "ellipsis",
                           whiteSpace: "nowrap", maxWidth: 130,
                         }}>{job.imageName}</span>
-                        <StatusBadge status={job.status} />
+                        <StatusBadge status={job.status} retries={job.retries || 0} />
                       </div>
 
-                      {/* Failure UI with retry + replace buttons */}
+                      {/* Failed — all auto-retries exhausted, show manual options */}
                       {job.status === "failed" && (
                         <div style={{ marginTop: 8 }}>
                           <div style={{
@@ -579,8 +701,8 @@ export default function App() {
                             borderRadius: 4, border: `1px solid ${c.error}30`,
                             marginBottom: 8,
                           }}>
-                            {job.error?.toLowerCase().includes("content violation") || job.error?.toLowerCase().includes("nsfw")
-                              ? "⚠ Blocked by Kling content filter (likely NSFW). Try a different image."
+                            {job.retries >= MAX_AUTO_RETRIES
+                              ? `Failed after ${MAX_AUTO_RETRIES} auto-retries (format change + resize). Try replacing the image.`
                               : job.error || "Unknown error"}
                           </div>
                           <div style={{ display: "flex", gap: 5 }}>
