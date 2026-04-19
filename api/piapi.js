@@ -100,7 +100,7 @@ async function uploadToTmpfile(buffer, filename, mime, { dispatcher } = {}) {
   const fd = new FormData();
   fd.append('file', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename);
 
-  const r = await fetch('https://api.secretme.cn/api/upload', {
+  const r = await fetch('https://tmpfile.link/api/upload', {
     method: 'POST',
     headers: { 'User-Agent': UA, Accept: 'application/json' },
     body: fd,
@@ -111,8 +111,8 @@ async function uploadToTmpfile(buffer, filename, mime, { dispatcher } = {}) {
   if (!r.ok) {
     throw makeUploadError(`tmpfile upload failed (${r.status})`, r.status, text);
   }
-  const url = json?.downloadUrl || json?.data?.downloadUrl;
-  if (!json?.success || !url || !/^https?:\/\//i.test(url)) {
+  const url = json?.downloadLink || json?.data?.downloadLink;
+  if (!url || !/^https?:\/\//i.test(url)) {
     throw makeUploadError('tmpfile returned invalid response', r.status, text);
   }
   return { url, raw: text };
