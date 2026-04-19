@@ -337,14 +337,27 @@ export default function App() {
     );
   }
 
-  async function uploadFile(file, jobId) {
-    const file_data = await fileToB64(file);
+  async function uploadFile(fileOrData, jobId) {
+    let file_name, file_type, file_data;
+
+    if (fileOrData instanceof File) {
+      // Legacy: file object
+      file_name = fileOrData.name;
+      file_type = fileOrData.type;
+      file_data = await fileToB64(fileOrData);
+    } else {
+      // New: pre-processed data object
+      file_name = fileOrData.name;
+      file_type = fileOrData.type;
+      file_data = fileOrData.base64;
+    }
+
     const providers = UPLOAD_PROVIDERS;
 
     let lastError = "Upload failed";
     for (const provider of providers) {
       try {
-        const data = await proxy({ action: provider.action, file_name: file.name, file_type: file.type, file_data });
+        const data = await proxy({ action: provider.action, file_name, file_type, file_data });
         const url = extractUploadUrl(data);
         if (!url) {
           const details = data?.raw ? (typeof data.raw === "string" ? data.raw : JSON.stringify(data.raw)) : "";
@@ -478,14 +491,13 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       updateJob(job.id, { status: "uploading", error: null });
       const fileToUpload = fileOverride || job.file;
 
-      // Upload original image without compression
-      const base64 = await fileToB64(fileToUpload);
-      const { url, provider } = await uploadFile({
-        name: fileToUpload.name,
-        type: fileToUpload.type,
-        base64: base64
-      }, job.id);
+      // Validate file before processing
+      if (!fileToUpload || !(fileToUpload instanceof File)) {
+        throw new Error("Invalid file object");
+      }
 
+      // Upload original image without compression
+      const { url, provider } = await uploadFile(fileToUpload, job.id);
       updateJob(job.id, { imageUrl: url, uploadProviderUsed: provider });
 
       // Wait 3 seconds for upload to propagate
@@ -500,12 +512,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       } catch (err) {
         log("warn", `Job #${job.id + 1}: URL validation failed, retrying upload`);
         // Retry upload once
-        const retryBase64 = await fileToB64(fileToUpload);
-        const { url: retryUrl, provider: retryProvider } = await uploadFile({
-          name: fileToUpload.name,
-          type: fileToUpload.type,
-          base64: retryBase64
-        }, job.id);
+        const { url: retryUrl, provider: retryProvider } = await uploadFile(fileToUpload, job.id);
         updateJob(job.id, { imageUrl: retryUrl, uploadProviderUsed: retryProvider });
 
         // Wait again
