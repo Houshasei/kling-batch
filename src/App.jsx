@@ -232,6 +232,8 @@ export default function App() {
 
     for (const provider of providers) {
       try {
+        log("info", `[Job ${jobId + 1}] Uploading to ${provider.label}...`);
+        
         // Use FormData for direct file upload
         const formData = new FormData();
         formData.append('file', file);
@@ -251,11 +253,11 @@ export default function App() {
           throw new Error(data?.message || data?.error || `No URL from ${provider.id}${details ? `: ${details.slice(0, 180)}` : ""}`);
         }
         
-        log("success", `Job #${jobId + 1}: uploaded via ${provider.id} (${url.slice(0, 90)}${url.length > 90 ? "..." : ""})`);
+        log("success", `[Job ${jobId + 1}] ✓ Uploaded via ${provider.label}`);
         return { url, provider: provider.id };
       } catch (err) {
         lastError = err.message;
-        log("warn", `Job #${jobId + 1}: ${provider.id} failed (${err.message})`);
+        log("warn", `[Job ${jobId + 1}] ${provider.label} failed, trying next...`);
       }
     }
     throw new Error(lastError);
@@ -384,53 +386,21 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
         throw new Error("Invalid file object");
       }
 
+      log("info", `[Job ${job.id + 1}] Uploading image: ${fileToUpload.name} (${(fileToUpload.size / 1024).toFixed(1)}KB)`);
+      
       // Upload original image without compression
       const { url, provider } = await uploadFile(fileToUpload, job.id);
       updateJob(job.id, { imageUrl: url, uploadProviderUsed: provider });
 
-      // Wait longer for upload to propagate (5 seconds)
-      await new Promise(r => setTimeout(r, 5000));
-
-      // Validate URL is accessible with retries
-      let finalUrl = url;
-      let urlAccessible = false;
+      log("info", `[Job ${job.id + 1}] Submitting to Kling API...`);
       
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const response = await fetch(finalUrl, { method: 'HEAD' });
-          if (response.ok) {
-            urlAccessible = true;
-            break;
-          }
-          log("warn", `Job #${job.id + 1}: URL validation attempt ${attempt}/3 failed (${response.status})`);
-        } catch (err) {
-          log("warn", `Job #${job.id + 1}: URL validation attempt ${attempt}/3 failed (${err.message})`);
-        }
-        
-        // Wait before retry
-        if (attempt < 3) {
-          await new Promise(r => setTimeout(r, 2000));
-        }
-      }
-
-      // If URL still not accessible, try re-uploading
-      if (!urlAccessible) {
-        log("warn", `Job #${job.id + 1}: URL not accessible after 3 attempts, re-uploading`);
-        const { url: retryUrl, provider: retryProvider } = await uploadFile(fileToUpload, job.id);
-        finalUrl = retryUrl;
-        updateJob(job.id, { imageUrl: retryUrl, uploadProviderUsed: retryProvider });
-        
-        // Wait for new upload to propagate
-        await new Promise(r => setTimeout(r, 5000));
-      }
-
-      const taskId = await submitJob(finalUrl, videoUrl);
+      const taskId = await submitJob(url, videoUrl);
       updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
-      log("info", `Job #${job.id + 1}: task ${taskId} submitted`);
+      log("success", `[Job ${job.id + 1}] Task submitted: ${taskId}`);
       return true;
     } catch (err) {
       updateJob(job.id, { status: "failed", error: err.message });
-      log("error", `Job #${job.id + 1}: ${err.message}`);
+      log("error", `[Job ${job.id + 1}] Failed: ${err.message}`);
       return false;
     }
   }
@@ -568,15 +538,19 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
           if (data?.status === "completed") {
             const vUrl = data?.output?.works?.[0]?.video?.resource_without_watermark || data?.output?.works?.[0]?.video?.resource || "";
             updateJob(job.id, { status: "completed", videoUrl: vUrl });
+            log("success", `[Job ${job.id + 1}] ✓ Video generation completed!`);
           } else if (data?.status === "failed") {
             const err = data?.error?.raw_message || data?.error?.message || "Generation failed";
             updateJob(job.id, { error: err });
+            log("error", `[Job ${job.id + 1}] Generation failed: ${err}`);
+            
             const current = jobsRef.current.find((j) => j.id === job.id);
             const activeVideoUrl = taskVideoUrlRef.current || refVideoUrlRef.current;
             if (isImageDecodeFetchError(err) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
-              log("warn", `Job #${job.id + 1}: decode/fetch error detected, retrying with inline base64`);
+              log("warn", `[Job ${job.id + 1}] Decode/fetch error - auto-retrying (${(current?.retries || 0) + 1}/${MAX_AUTO_RETRIES})`);
               await autoRetry(current, activeVideoUrl, { forceInline: true });
             } else if (isContentFilterError(err) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
+              log("warn", `[Job ${job.id + 1}] Content filter error - auto-retrying (${(current?.retries || 0) + 1}/${MAX_AUTO_RETRIES})`);
               await autoRetry(current, activeVideoUrl);
             } else {
               updateJob(job.id, { status: "failed" });
