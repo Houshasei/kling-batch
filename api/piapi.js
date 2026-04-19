@@ -15,7 +15,6 @@ export default async function handler(req, res) {
 
   try {
     if (action === "upload") {
-      // Upload to PiAPI ephemeral_resource (base64 JSON)
       const r = await fetch("https://api.piapi.ai/api/ephemeral_resource", {
         method: "POST",
         headers: { "x-api-key": apiKey, "Content-Type": "application/json" },
@@ -32,7 +31,7 @@ export default async function handler(req, res) {
       const d = await r.json();
       return res.status(r.status).json(d);
     } else if (action === "poll") {
-      const r = await fetch(`https://api.piapi.ai/api/v1/task/${payload.taskId}`, {
+      const r = await fetch("https://api.piapi.ai/api/v1/task/" + payload.taskId, {
         method: "GET",
         headers: { "x-api-key": apiKey },
       });
