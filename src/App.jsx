@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Analytics } from "@vercel/analytics/react";
 import JSZip from "jszip";
 
 const POLL_INTERVAL = 8000;
-const MAX_AUTO_RETRIES = 3;
+const MAX_AUTO_RETRIES = 5;
+const UPLOAD_PROPAGATION_MS = 2000;
 const STORAGE_API_KEY = "kling_batch_api_key";
-const MAX_VIDEO_SIZE = 50 * 1024 * 1024; // 50MB max for video files
-const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB max for image files
+const STORAGE_UPLOAD_HOST = "kling_batch_upload_host";
+const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+const VERCEL_HOBBY_LIMIT = 4 * 1024 * 1024;
+const LOG_BUFFER = 500;
 
 const font = `'DM Sans', sans-serif`;
 const mono = `'JetBrains Mono', 'Fira Code', monospace`;
@@ -25,10 +29,23 @@ const c = {
   tag: "#2d2d3a",
 };
 
-const UPLOAD_PROVIDERS = [
-  { id: "piapi_upload", label: "PiAPI Upload", action: "upload_piapi" },
-  { id: "filebin", label: "Filebin", action: "upload_filebin" },
+const HOST_OPTIONS = [
+  { id: "litterbox", label: "Litterbox \u00B7 1h" },
+  { id: "0x0", label: "0x0.st" },
 ];
+
+const VIDEO_EXTS = ["mp4", "mov"];
+const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp"];
+
+class ProxyError extends Error {
+  constructor(message, { status, action, body } = {}) {
+    super(message);
+    this.name = "ProxyError";
+    this.status = status;
+    this.action = action;
+    this.body = body;
+  }
+}
 
 function fileToPreview(file) {
   return new Promise((resolve) => {
@@ -38,62 +55,24 @@ function fileToPreview(file) {
   });
 }
 
-function normalizeUrl(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return "";
-  let cleaned = raw;
-  try {
-    cleaned = decodeURIComponent(cleaned);
-  } catch (_) {}
-  // Encode spaces and special characters instead of removing them
-  cleaned = cleaned.replace(/\s+/g, " ");
-  if (!/^https?:\/\//i.test(cleaned)) return "";
-  try {
-    const url = new URL(cleaned);
-    // Encode the pathname and search params
-    url.pathname = url.pathname.split('/').map(segment => encodeURIComponent(decodeURIComponent(segment))).join('/');
-    if (url.search) {
-      const params = new URLSearchParams(url.search);
-      const encodedParams = new URLSearchParams();
-      for (const [key, value] of params) {
-        encodedParams.append(encodeURIComponent(key), encodeURIComponent(value));
-      }
-      url.search = encodedParams.toString();
-    }
-    return url.toString();
-  } catch (_) {
-    return "";
-  }
+function fileExt(name) {
+  const m = String(name || "").toLowerCase().match(/\.([a-z0-9]{2,5})$/);
+  return m ? m[1] : "";
 }
 
-function getExtFromUrl(url) {
-  try {
-    const p = new URL(url).pathname || "";
-    const m = p.toLowerCase().match(/\.([a-z0-9]{2,6})$/);
-    return m ? m[1] : "";
-  } catch {
-    return "";
+function isAllowedFile(file, kind) {
+  if (!file) return false;
+  const type = String(file.type || "").toLowerCase();
+  const ext = fileExt(file.name);
+  if (kind === "video") {
+    if (type.startsWith("video/")) return true;
+    return VIDEO_EXTS.includes(ext);
   }
-}
-
-function sanitizeVideoFileNameFromUrl(url) {
-  try {
-    const p = new URL(url).pathname || "";
-    const raw = decodeURIComponent(p.split("/").pop() || "motion.mp4");
-    const cleaned = raw
-      .replace(/[^a-zA-Z0-9._-]+/g, "_")
-      .replace(/^_+|_+$/g, "");
-    if (/\.(mp4|mov)$/i.test(cleaned)) return cleaned;
-    return `${cleaned || "motion"}.mp4`;
-  } catch {
-    return `motion-${Date.now()}.mp4`;
+  if (kind === "image") {
+    if (type.startsWith("image/")) return true;
+    return IMAGE_EXTS.includes(ext);
   }
-}
-
-async function validateVideoUrl(url, proxy) {
-  const result = await proxy({ action: "fetch_video", url });
-  if (result.error) throw new Error(result.error);
-  return result.data;
+  return false;
 }
 
 function safeBase(name) {
@@ -105,8 +84,16 @@ function safeBase(name) {
   );
 }
 
-// Removed: All compression and base64 conversion functions
-// Files are now uploaded directly via FormData without compression
+function truncate(str, max = 2048) {
+  const s = String(str || "");
+  return s.length > max ? s.slice(0, max) + `… (+${s.length - max} chars)` : s;
+}
+
+function formatTs() {
+  const d = new Date();
+  const pad = (n, w = 2) => String(n).padStart(w, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
 
 function StatusBadge({ status, retries }) {
   const map = {
@@ -126,17 +113,40 @@ function StatusBadge({ status, retries }) {
   );
 }
 
-function OnlineBadge({ ok }) {
-  const color = ok === true ? c.success : ok === false ? c.error : c.warn;
-  const txt = ok === true ? "online" : ok === false ? "offline" : "unknown";
-  return <span style={{ fontSize: 9, color, fontFamily: mono, textTransform: "uppercase" }}>{txt}</span>;
+function LogEntry({ entry }) {
+  const [open, setOpen] = useState(false);
+  const color = entry.type === "error" ? c.error : entry.type === "warn" ? c.warn : entry.type === "success" ? c.success : entry.type === "debug" ? c.hint : c.muted;
+  const jobTag = entry.jobId != null ? `[Job ${entry.jobId + 1}] ` : "";
+  const stageTag = entry.stage && entry.stage !== "system" ? `[${entry.stage}] ` : "";
+  return (
+    <div style={{ fontSize: 10, fontFamily: mono, color, lineHeight: 1.5 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 4 }}>
+        <span style={{ color: c.hint, flexShrink: 0 }}>[{entry.ts}]</span>
+        <span style={{ flex: 1, wordBreak: "break-word" }}>{stageTag}{jobTag}{entry.message}</span>
+        {entry.detail && (
+          <button
+            onClick={() => setOpen((v) => !v)}
+            style={{ background: "transparent", border: "none", color: c.hint, fontFamily: mono, fontSize: 10, cursor: "pointer", padding: 0, flexShrink: 0 }}
+            title="Toggle detail"
+          >
+            {open ? "\u25BE" : "\u25B8"}
+          </button>
+        )}
+      </div>
+      {open && entry.detail && (
+        <pre style={{ margin: "4px 0 4px 18px", padding: "6px 8px", background: c.bg, border: `1px solid ${c.border}`, borderRadius: 4, color: c.text, fontFamily: mono, fontSize: 10, maxHeight: 200, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+          {entry.detail}
+        </pre>
+      )}
+    </div>
+  );
 }
 
 export default function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(STORAGE_API_KEY) || "");
   const [connected, setConnected] = useState(() => Boolean(localStorage.getItem(STORAGE_API_KEY)));
+  const [uploadHost, setUploadHost] = useState(() => localStorage.getItem(STORAGE_UPLOAD_HOST) || "litterbox");
 
-  const [refVideoName, setRefVideoName] = useState("");
   const [refVideoFileName, setRefVideoFileName] = useState("");
   const [refVideoError, setRefVideoError] = useState("");
   const [videoDuration, setVideoDuration] = useState(10);
@@ -150,211 +160,272 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [batchDone, setBatchDone] = useState(false);
   const [logs, setLogs] = useState([]);
-  const [serviceStatus, setServiceStatus] = useState({ checking: false, data: null, lastChecked: null });
-  const [isDownloadingZip, setIsDownloadingZip] = useState(false);
+  const [logFilter, setLogFilter] = useState("all");
+  const [logSearch, setLogSearch] = useState("");
+  const [debugLogs, setDebugLogs] = useState(false);
+  const [zipProgress, setZipProgress] = useState({ phase: "idle", done: 0, total: 0, percent: 0 });
 
   const imgRef = useRef();
   const replaceImgRefs = useRef({});
   const jobsRef = useRef([]);
   const pollRef = useRef(null);
   const refVideoUrlRef = useRef("");
-  const taskVideoUrlRef = useRef("");
-  const probingRef = useRef(false);
+  const refVideoFileRef = useRef(null);
   const logsEndRef = useRef(null);
+  const logsContainerRef = useRef(null);
+  const autoScrollRef = useRef(true);
+  const videoDragCounter = useRef(0);
+  const imageDragCounter = useRef(0);
+  const debugRef = useRef(false);
+
+  useEffect(() => { debugRef.current = debugLogs; }, [debugLogs]);
 
   const rate = mode === "std" ? 0.065 : 0.104;
   const perVideo = rate * videoDuration;
   const batchEst = perVideo * images.length;
 
-  const log = useCallback((type, message) => {
-    setLogs((prev) => [...prev.slice(-199), { id: Date.now() + Math.random(), ts: new Date().toLocaleTimeString(), type, message }]);
+  const logEvent = useCallback(({ type = "info", stage = "system", jobId = null, message, detail = null }) => {
+    setLogs((prev) => {
+      const next = [...prev, { id: Date.now() + Math.random(), ts: formatTs(), type, stage, jobId, message, detail }];
+      return next.length > LOG_BUFFER ? next.slice(next.length - LOG_BUFFER) : next;
+    });
   }, []);
 
-  // Auto-scroll logs to bottom
+  const log = useCallback((type, message, detail = null) => {
+    logEvent({ type, stage: "system", message, detail });
+  }, [logEvent]);
+
+  const debugLog = useCallback((message, detail = null) => {
+    if (!debugRef.current) return;
+    logEvent({ type: "debug", stage: "system", message, detail });
+  }, [logEvent]);
+
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = logsContainerRef.current;
+    if (!el) return;
+    if (autoScrollRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [logs]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_API_KEY, apiKey || "");
   }, [apiKey]);
 
-  const handleImages = useCallback(async (e) => {
-    const files = Array.from(e.target.files || []);
-    const items = await Promise.all(files.map(async (f) => ({ name: f.name, file: f, preview: await fileToPreview(f) })));
+  useEffect(() => {
+    localStorage.setItem(STORAGE_UPLOAD_HOST, uploadHost);
+  }, [uploadHost]);
+
+  // Global drop guard: prevent browser from navigating when files are dropped outside drop zones.
+  useEffect(() => {
+    const onDragOver = (e) => { e.preventDefault(); };
+    const onDrop = (e) => { e.preventDefault(); };
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    if (pollRef.current) clearInterval(pollRef.current);
+  }, []);
+
+  const filteredLogs = useMemo(() => {
+    const q = logSearch.trim().toLowerCase();
+    return logs.filter((l) => {
+      if (logFilter !== "all" && l.type !== logFilter) return false;
+      if (q) {
+        const hay = `${l.message} ${l.detail || ""} ${l.stage || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [logs, logFilter, logSearch]);
+
+  function handleLogsScroll() {
+    const el = logsContainerRef.current;
+    if (!el) return;
+    autoScrollRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  }
+
+  function copyLogs() {
+    const text = filteredLogs.map((l) => {
+      const prefix = `[${l.ts}] [${l.stage}]${l.jobId != null ? ` [Job ${l.jobId + 1}]` : ""} [${l.type}] ${l.message}`;
+      return l.detail ? `${prefix}\n${l.detail}` : prefix;
+    }).join("\n");
+    navigator.clipboard?.writeText(text).then(
+      () => log("success", "Logs copied to clipboard"),
+      (err) => log("error", `Copy failed: ${err.message}`)
+    );
+  }
+
+  const handleImageFiles = useCallback(async (files) => {
+    const accepted = files.filter((f) => isAllowedFile(f, "image"));
+    if (accepted.length === 0) return;
+    const items = await Promise.all(accepted.map(async (f) => ({ name: f.name, file: f, preview: await fileToPreview(f) })));
     setImages((p) => [...p, ...items]);
-    log("info", `Added ${files.length} image(s)`);
-    e.target.value = "";
+    log("info", `Added ${accepted.length} image(s)`);
   }, [log]);
 
   const removeImage = (i) => setImages((p) => p.filter((_, idx) => idx !== i));
 
-  async function proxy(body) {
+  async function proxyJson(body) {
     const action = body?.action;
-    const needsApiKey = action === "create" || action === "poll" || action === "upload" || action === "upload_piapi";
-    const r = await fetch("/api/piapi", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(needsApiKey ? { apiKey, ...body } : body),
-    });
-    const txt = await r.text();
-    try {
-      return JSON.parse(txt);
-    } catch (_) {
-      return { error: txt || "Invalid response" };
+    const needsApiKey = action === "create" || action === "poll";
+    const payload = needsApiKey ? { apiKey, ...body } : body;
+    if (debugRef.current) {
+      debugLog(`-> /api/piapi ${action}`, truncate(JSON.stringify(payload), 1024));
     }
+    let r;
+    try {
+      r = await fetch("/api/piapi", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      throw new ProxyError(`Network error calling ${action}: ${err.message}`, { action });
+    }
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) {}
+    if (debugRef.current) {
+      debugLog(`<- /api/piapi ${action} ${r.status}`, truncate(text, 1024));
+    }
+    if (!r.ok) {
+      throw new ProxyError(
+        json?.error || json?.message || `HTTP ${r.status}`,
+        { status: r.status, action, body: text }
+      );
+    }
+    if (json && json.error) {
+      throw new ProxyError(json.error, { status: r.status, action, body: text });
+    }
+    return json ?? {};
   }
 
   function extractUploadUrl(resp) {
     return (
-      resp?.downloadLinkEncoded ||
-      resp?.downloadLink ||
       resp?.data?.downloadLinkEncoded ||
       resp?.data?.downloadLink ||
-      resp?.data?.url ||
-      resp?.url ||
-      resp?.link ||
-      resp?.data?.link ||
-      resp?.data?.file?.url ||
-      resp?.file?.url ||
+      resp?.downloadLinkEncoded ||
+      resp?.downloadLink ||
       ""
     );
   }
 
-  async function uploadFile(file, jobId) {
-    // Validate file size
-    if (file.size > MAX_IMAGE_SIZE) {
-      throw new Error(`Image file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_IMAGE_SIZE / 1024 / 1024}MB`);
+  async function uploadToHost(file, host, { stage = "upload", jobId = null, label = "" } = {}) {
+    const chosenHost = host || uploadHost;
+    const tag = label ? `${label}: ` : "";
+    logEvent({ type: "info", stage, jobId, message: `${tag}Uploading to ${chosenHost} (${(file.size / 1024 / 1024).toFixed(2)}MB)` });
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("action", "upload_file");
+    formData.append("host", chosenHost);
+
+    let r;
+    try {
+      r = await fetch("/api/piapi", { method: "POST", body: formData });
+    } catch (err) {
+      throw new ProxyError(`Network error during upload: ${err.message}`, { action: "upload_file" });
     }
 
-    const providers = UPLOAD_PROVIDERS;
-    let lastError = "Upload failed";
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) {}
 
-    for (const provider of providers) {
-      try {
-        log("info", `[Job ${jobId + 1}] Uploading to ${provider.label}...`);
-        
-        // Use FormData for direct file upload
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('action', provider.action);
-        formData.append('apiKey', apiKey);
-
-        const r = await fetch("/api/piapi", {
-          method: "POST",
-          body: formData, // Send as FormData, not JSON
+    if (!r.ok) {
+      const isSizeErr = r.status === 413 || r.status === 504 || /payload too large|request entity too large/i.test(text);
+      if (isSizeErr && import.meta.env?.PROD) {
+        logEvent({
+          type: "warn",
+          stage,
+          jobId,
+          message: `${tag}Proxy rejected (${r.status}) — file likely exceeds Vercel body limit. Attempting direct browser upload…`,
+          detail: truncate(text, 2048),
         });
-
-        const data = await r.json();
-        const url = extractUploadUrl(data);
-        
-        if (!url) {
-          const details = data?.raw ? (typeof data.raw === "string" ? data.raw : JSON.stringify(data.raw)) : "";
-          throw new Error(data?.message || data?.error || `No URL from ${provider.id}${details ? `: ${details.slice(0, 180)}` : ""}`);
+        try {
+          const direct = await directHostUpload(file, chosenHost);
+          logEvent({ type: "success", stage, jobId, message: `${tag}Uploaded directly to ${chosenHost}: ${direct}` });
+          await new Promise((res) => setTimeout(res, UPLOAD_PROPAGATION_MS));
+          return { url: direct, host: chosenHost };
+        } catch (derr) {
+          throw new ProxyError(
+            `Upload failed (proxy ${r.status}, direct: ${derr.message}). On Vercel Hobby, body limit is ~4.5MB. Use a smaller file or upgrade to Pro.`,
+            { status: r.status, action: "upload_file", body: `${text}\n---\nDirect: ${derr.message}` }
+          );
         }
-        
-        log("success", `[Job ${jobId + 1}] ✓ Uploaded via ${provider.label}`);
-        return { url, provider: provider.id };
-      } catch (err) {
-        lastError = err.message;
-        log("warn", `[Job ${jobId + 1}] ${provider.label} failed, trying next...`);
       }
+      throw new ProxyError(
+        json?.error || json?.message || `Upload HTTP ${r.status}`,
+        { status: r.status, action: "upload_file", body: truncate(text, 4096) }
+      );
     }
-    throw new Error(lastError);
+
+    const url = extractUploadUrl(json || {});
+    if (!url) {
+      throw new ProxyError("Upload returned no URL", { status: r.status, action: "upload_file", body: truncate(text, 2048) });
+    }
+    const finalHost = json?.data?.uploadedTo || chosenHost;
+    logEvent({ type: "success", stage, jobId, message: `${tag}Uploaded via ${finalHost}: ${url}` });
+    await new Promise((res) => setTimeout(res, UPLOAD_PROPAGATION_MS));
+    debugLog(`Propagation wait ${UPLOAD_PROPAGATION_MS}ms done (${finalHost})`);
+    return { url, host: finalHost };
   }
 
-  async function submitJob(imageUrl, videoUrl) {
-    const d = await proxy({
-      action: "create",
-      taskBody: {
-        model: "kling",
-        task_type: "motion_control",
-        input: {
-          image_url: imageUrl,
-          video_url: videoUrl,
-          motion_direction: orientation,
-          keep_original_sound: keepSound,
-          mode,
-          version: "2.6",
+  async function directHostUpload(file, host) {
+    if (host === "litterbox") {
+      const fd = new FormData();
+      fd.append("reqtype", "fileupload");
+      fd.append("time", "1h");
+      fd.append("fileToUpload", file);
+      const r = await fetch("https://litterbox.catbox.moe/resources/internals/api.php", { method: "POST", body: fd });
+      const t = (await r.text()).trim();
+      if (!r.ok || !/^https?:\/\//.test(t)) throw new Error(t || `HTTP ${r.status}`);
+      return t;
+    }
+    // 0x0.st rejects browser-origin due to CORS; attempt anyway.
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("https://0x0.st", { method: "POST", body: fd });
+    const t = (await r.text()).trim();
+    if (!r.ok || !/^https?:\/\//.test(t)) throw new Error(t || `HTTP ${r.status}`);
+    return t;
+  }
+
+  async function submitCreateTask(imageUrl, videoUrl, jobId) {
+    try {
+      const d = await proxyJson({
+        action: "create",
+        taskBody: {
+          model: "kling",
+          task_type: "motion_control",
+          input: {
+            image_url: imageUrl,
+            video_url: videoUrl,
+            motion_direction: orientation,
+            keep_original_sound: keepSound,
+            mode,
+            version: "2.6",
+          },
         },
-      },
-    });
-    if (d?.data?.task_id) return d.data.task_id;
-    throw new Error(d?.message || d?.error?.message || "Submit failed");
+      });
+      if (d?.data?.task_id) return d.data.task_id;
+      const msg = d?.message || d?.error?.message || d?.error || "Create task failed";
+      throw new ProxyError(msg, { action: "create", body: truncate(JSON.stringify(d), 2048) });
+    } catch (err) {
+      if (err instanceof ProxyError) throw err;
+      throw new ProxyError(err.message, { action: "create" });
+    }
   }
 
   async function checkJob(taskId) {
-    const d = await proxy({ action: "poll", taskId });
+    const d = await proxyJson({ action: "poll", taskId });
     return d?.data;
   }
-
-async function prepareVideoUrlForTask(rawVideoUrl) {
-    const normalized = normalizeUrl(rawVideoUrl);
-    if (!normalized) throw new Error("Invalid video URL. Use full http(s) link.");
-
-    const ext = getExtFromUrl(normalized);
-    if (ext && !["mp4", "mov"].includes(ext)) {
-      throw new Error("Motion video must be .mp4 or .mov");
-    }
-
-    // Validate that the URL returns video content
-    const validated = await validateVideoUrl(normalized, proxy);
-
-    return { url: validated.url, provider: "direct_video_url" };
-  }
-
-  async function runProbe() {
-    if (probingRef.current) return;
-    probingRef.current = true;
-    setServiceStatus((p) => ({ ...p, checking: true }));
-
-    async function pingDomain(url, timeoutMs = 6000) {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), timeoutMs);
-      try {
-        await fetch(url, {
-          method: "GET",
-          mode: "no-cors",
-          cache: "no-store",
-          signal: ctl.signal,
-        });
-        return { ok: true, status: null, error: null };
-      } catch (err) {
-        return { ok: false, status: null, error: err?.message || "Network error" };
-      } finally {
-        clearTimeout(t);
-      }
-    }
-
-    try {
-      const [piapi, filebin] = await Promise.all([
-        pingDomain("https://api.piapi.ai/"),
-        pingDomain("https://filebin.net/"),
-      ]);
-
-      setServiceStatus({
-        checking: false,
-        data: {
-          piapi,
-          filebin,
-        },
-        lastChecked: Date.now(),
-      });
-      log("success", `Service probe done (piapi: ${piapi.ok ? "online" : "offline"}, filebin: ${filebin.ok ? "online" : "offline"})`);
-    } catch (err) {
-      setServiceStatus({ checking: false, data: null, lastChecked: Date.now() });
-      log("error", `Probe failed: ${err.message}`);
-    } finally {
-      probingRef.current = false;
-    }
-  }
-
-  useEffect(() => {
-    log("info", "Auto-probe on startup");
-    runProbe();
-    // Intentionally run once on initial page load/refresh.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   function updateJob(id, patch) {
     jobsRef.current = jobsRef.current.map((j) => (j.id === id ? { ...j, ...patch } : j));
@@ -376,36 +447,38 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     );
   }
 
-  async function submitSingleJob(job, videoUrl, fileOverride) {
+  async function submitSingleJob(job, videoUrl, { forceReupload = false } = {}) {
     try {
       updateJob(job.id, { status: "uploading", error: null });
-      const fileToUpload = fileOverride || job.file;
-
-      // Validate file before processing
+      const fileToUpload = job.file;
       if (!fileToUpload || !(fileToUpload instanceof File)) {
         throw new Error("Invalid file object");
       }
 
-      log("info", `[Job ${job.id + 1}] Uploading image: ${fileToUpload.name} (${(fileToUpload.size / 1024).toFixed(1)}KB)`);
-      
-      // Upload original image without compression
-      const { url, provider } = await uploadFile(fileToUpload, job.id);
-      updateJob(job.id, { imageUrl: url, uploadProviderUsed: provider });
+      let imageUrl = job.imageUrl;
+      if (!imageUrl || forceReupload) {
+        const hostSnapshot = job.hostSnapshot || uploadHost;
+        const { url, host } = await uploadToHost(fileToUpload, hostSnapshot, { stage: "upload", jobId: job.id });
+        imageUrl = url;
+        updateJob(job.id, { imageUrl: url, uploadProviderUsed: host });
+      }
 
-      log("info", `[Job ${job.id + 1}] Submitting to Kling API...`);
-      
-      const taskId = await submitJob(url, videoUrl);
+      logEvent({ type: "info", stage: "create", jobId: job.id, message: `Submitting to Kling API…` });
+      const taskId = await submitCreateTask(imageUrl, videoUrl, job.id);
       updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
-      log("success", `[Job ${job.id + 1}] Task submitted: ${taskId}`);
+      logEvent({ type: "success", stage: "create", jobId: job.id, message: `Task submitted: ${taskId}` });
       return true;
     } catch (err) {
+      const detail = err instanceof ProxyError
+        ? `action=${err.action || "?"} status=${err.status || "?"}\n${truncate(err.body || "", 2048)}`
+        : err?.stack || null;
       updateJob(job.id, { status: "failed", error: err.message });
-      log("error", `[Job ${job.id + 1}] Failed: ${err.message}`);
+      logEvent({ type: "error", stage: "upload", jobId: job.id, message: `Failed: ${err.message}`, detail });
       return false;
     }
   }
 
-  async function autoRetry(job, videoUrl, options = {}) {
+  async function autoRetry(job, videoUrl, { forceReupload = false } = {}) {
     const retries = (job.retries || 0) + 1;
     if (retries > MAX_AUTO_RETRIES) {
       updateJob(job.id, { status: "failed", retries });
@@ -413,48 +486,57 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     }
     updateJob(job.id, { status: "retrying", retries, error: null });
     await new Promise((r) => setTimeout(r, 1800));
-    // Retry with original file (no compression/conversion)
-    await submitSingleJob(job, videoUrl, job.file, options);
+    // On decode/fetch retries, drop the stale URL to force fresh re-upload.
+    if (forceReupload) {
+      const current = jobsRef.current.find((j) => j.id === job.id);
+      if (current) updateJob(job.id, { imageUrl: null });
+    }
+    const fresh = jobsRef.current.find((j) => j.id === job.id);
+    await submitSingleJob(fresh || job, videoUrl, { forceReupload });
   }
 
-  function parseReference(urlInput) {
-    const cleaned = normalizeUrl(urlInput);
-    if (!urlInput.trim()) {
+  async function handleRefVideoFile(file) {
+    if (!file) return;
+    if (!isAllowedFile(file, "video")) {
+      setRefVideoError("Unsupported file. Use MP4 or MOV.");
+      log("error", `Rejected ref video (type=${file.type || "unknown"}, ext=${fileExt(file.name)})`);
+      return;
+    }
+    if (file.size > MAX_VIDEO_SIZE) {
+      setRefVideoError(`Video file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_VIDEO_SIZE / 1024 / 1024}MB`);
+      log("error", `Video file too large: ${file.name}`);
+      return;
+    }
+    try {
       setRefVideoError("");
-      refVideoUrlRef.current = "";
-      return;
-    }
-    if (!cleaned) {
-      setRefVideoError("Invalid URL. Use full http(s) link.");
-      refVideoUrlRef.current = "";
-      return;
-    }
-    setRefVideoError("");
-    refVideoUrlRef.current = cleaned;
+      const { url, host } = await uploadToHost(file, uploadHost, { stage: "upload", jobId: null, label: "RefVideo" });
+      refVideoUrlRef.current = url;
+      refVideoFileRef.current = file;
+      setRefVideoFileName(file.name);
 
-    const v = document.createElement("video");
-    v.preload = "metadata";
-    v.onloadedmetadata = () => {
-      if (v.duration && !Number.isNaN(v.duration)) setVideoDuration(Math.ceil(v.duration));
-    };
-    v.src = cleaned;
+      // Try to read duration client-side.
+      try {
+        const v = document.createElement("video");
+        v.preload = "metadata";
+        v.src = URL.createObjectURL(file);
+        v.onloadedmetadata = () => {
+          if (v.duration && !Number.isNaN(v.duration)) setVideoDuration(Math.ceil(v.duration));
+          URL.revokeObjectURL(v.src);
+        };
+      } catch (_) {}
+
+      log("success", `Reference video ready (${host}): ${file.name}`);
+    } catch (err) {
+      setRefVideoError(err.message);
+      const detail = err instanceof ProxyError ? `action=${err.action} status=${err.status}\n${truncate(err.body || "", 2048)}` : null;
+      logEvent({ type: "error", stage: "upload", message: `Ref video upload failed: ${err.message}`, detail });
+    }
   }
 
   async function startBatch() {
     if (!apiKey || !refVideoUrlRef.current || images.length === 0 || refVideoError) return;
-    if (!serviceStatus.data) await runProbe();
 
-    let taskVideoUrl = refVideoUrlRef.current;
-    try {
-      const preparedVideo = await prepareVideoUrlForTask(refVideoUrlRef.current);
-      taskVideoUrl = preparedVideo.url;
-      taskVideoUrlRef.current = preparedVideo.url;
-      log("success", `Reference video uploaded via ${preparedVideo.provider}`);
-    } catch (err) {
-      setRefVideoError(err.message || "Failed to prepare reference video");
-      log("error", `Reference video prep failed: ${err.message}`);
-      return;
-    }
+    const videoUrl = refVideoUrlRef.current;
 
     const initial = images.map((img, i) => ({
       id: i,
@@ -466,6 +548,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       videoUrl: null,
       imageUrl: null,
       uploadProviderUsed: null,
+      hostSnapshot: uploadHost,
       error: null,
       retries: 0,
     }));
@@ -474,20 +557,13 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     setRunning(true);
     setBatchDone(false);
 
-    const vurl = taskVideoUrl;
-    
-    // Process jobs sequentially with small delay to avoid overwhelming the upload service
-    for (let i = 0; i < initial.length; i++) {
-      const job = initial[i];
-      await submitSingleJob(job, vurl);
-      
-      // Add small delay between jobs (except for the last one)
-      if (i < initial.length - 1) {
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-    
+    logEvent({ type: "info", stage: "system", message: `Starting batch: ${initial.length} job(s), host=${uploadHost}, mode=${mode}` });
+
+    // Start polling immediately; fire all job chains in parallel.
     startPolling();
+    for (const job of initial) {
+      submitSingleJob(job, videoUrl);
+    }
   }
 
   async function retryJob(id) {
@@ -498,12 +574,16 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       setBatchDone(false);
       setRunning(true);
     }
-    const activeVideoUrl = taskVideoUrlRef.current || refVideoUrlRef.current;
-    await submitSingleJob(job, activeVideoUrl);
+    const vurl = refVideoUrlRef.current;
+    await submitSingleJob(job, vurl, { forceReupload: true });
     if (!pollRef.current) startPolling();
   }
 
   async function replaceAndRetry(id, newFile) {
+    if (!isAllowedFile(newFile, "image")) {
+      log("error", `Replacement rejected (not a valid image): ${newFile?.name}`);
+      return;
+    }
     const preview = await fileToPreview(newFile);
     updateJob(id, { file: newFile, imageName: newFile.name, preview, status: "uploading", imageUrl: null, retries: 0, error: null });
     const job = jobsRef.current.find((j) => j.id === id);
@@ -512,8 +592,8 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       setBatchDone(false);
       setRunning(true);
     }
-    const activeVideoUrl = taskVideoUrlRef.current || refVideoUrlRef.current;
-    await submitSingleJob(job, activeVideoUrl);
+    const vurl = refVideoUrlRef.current;
+    await submitSingleJob(job, vurl, { forceReupload: true });
     if (!pollRef.current) startPolling();
   }
 
@@ -522,7 +602,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     pollRef.current = setInterval(async () => {
       const active = jobsRef.current.filter((j) => j.status === "processing");
       if (active.length === 0) {
-        const waiting = jobsRef.current.some((j) => j.status === "uploading" || j.status === "retrying");
+        const waiting = jobsRef.current.some((j) => ["uploading", "retrying", "pending"].includes(j.status));
         if (!waiting) {
           clearInterval(pollRef.current);
           pollRef.current = null;
@@ -538,42 +618,44 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
           if (data?.status === "completed") {
             const vUrl = data?.output?.works?.[0]?.video?.resource_without_watermark || data?.output?.works?.[0]?.video?.resource || "";
             updateJob(job.id, { status: "completed", videoUrl: vUrl });
-            log("success", `[Job ${job.id + 1}] ✓ Video generation completed!`);
+            logEvent({ type: "success", stage: "poll", jobId: job.id, message: `Video generation completed` });
           } else if (data?.status === "failed") {
-            const err = data?.error?.raw_message || data?.error?.message || "Generation failed";
-            updateJob(job.id, { error: err });
-            log("error", `[Job ${job.id + 1}] Generation failed: ${err}`);
-            
+            const errMsg = data?.error?.raw_message || data?.error?.message || "Generation failed";
+            const detail = truncate(JSON.stringify(data?.error || data, null, 2), 2048);
+            updateJob(job.id, { error: errMsg });
+            logEvent({ type: "error", stage: "poll", jobId: job.id, message: `Generation failed: ${errMsg}`, detail });
+
             const current = jobsRef.current.find((j) => j.id === job.id);
-            const activeVideoUrl = taskVideoUrlRef.current || refVideoUrlRef.current;
-            if (isImageDecodeFetchError(err) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
-              log("warn", `[Job ${job.id + 1}] Decode/fetch error - auto-retrying (${(current?.retries || 0) + 1}/${MAX_AUTO_RETRIES})`);
-              await autoRetry(current, activeVideoUrl, { forceInline: true });
-            } else if (isContentFilterError(err) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
-              log("warn", `[Job ${job.id + 1}] Content filter error - auto-retrying (${(current?.retries || 0) + 1}/${MAX_AUTO_RETRIES})`);
-              await autoRetry(current, activeVideoUrl);
+            const attemptNext = (current?.retries || 0) + 1;
+            const vurl = refVideoUrlRef.current;
+
+            if (isImageDecodeFetchError(errMsg) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
+              logEvent({ type: "warn", stage: "poll", jobId: job.id, message: `Decode/fetch error detected — re-uploading (attempt ${attemptNext}/${MAX_AUTO_RETRIES})`, detail });
+              await autoRetry(current, vurl, { forceReupload: true });
+            } else if (isContentFilterError(errMsg) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
+              logEvent({ type: "warn", stage: "poll", jobId: job.id, message: `Content filter error — auto-retrying (attempt ${attemptNext}/${MAX_AUTO_RETRIES})` });
+              await autoRetry(current, vurl);
             } else {
               updateJob(job.id, { status: "failed" });
             }
           }
-        } catch (_) {}
+        } catch (err) {
+          debugLog(`Poll error for job ${job.id + 1}: ${err.message}`);
+        }
       }
     }, POLL_INTERVAL);
   }
-
-  useEffect(() => () => {
-    if (pollRef.current) clearInterval(pollRef.current);
-  }, []);
 
   function resetBatch() {
     setJobs([]);
     setBatchDone(false);
     setImages([]);
-    setRefVideoName("");
+    setRefVideoFileName("");
     setRefVideoError("");
     setVideoDuration(10);
     refVideoUrlRef.current = "";
-    taskVideoUrlRef.current = "";
+    refVideoFileRef.current = null;
+    setZipProgress({ phase: "idle", done: 0, total: 0, percent: 0 });
   }
 
   const completedCount = jobs.filter((j) => j.status === "completed").length;
@@ -583,6 +665,67 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
 
   const safeDownloadName = (job) => `${safeBase(job.imageName)}.mp4`;
   const proxyDownload = (job) => `/api/piapi?action=download_proxy&url=${encodeURIComponent(job.videoUrl)}&filename=${encodeURIComponent(safeDownloadName(job))}`;
+
+  async function downloadAllZip() {
+    if (zipProgress.phase !== "idle" && zipProgress.phase !== "done") return;
+    const completedJobs = jobs.filter((j) => j.status === "completed");
+    if (completedJobs.length === 0) return;
+
+    setZipProgress({ phase: "downloading", done: 0, total: completedJobs.length, percent: 0 });
+    logEvent({ type: "info", stage: "zip", message: `Fetching ${completedJobs.length} videos in parallel…` });
+
+    const zip = new JSZip();
+    const folder = zip.folder("kling-batch-videos");
+    let done = 0;
+    let okCount = 0;
+
+    await Promise.all(completedJobs.map(async (job) => {
+      try {
+        const r = await fetch(proxyDownload(job));
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        folder.file(safeDownloadName(job), blob, { compression: "STORE" });
+        okCount++;
+      } catch (err) {
+        logEvent({ type: "error", stage: "zip", jobId: job.id, message: `Download failed: ${err.message}`, detail: proxyDownload(job) });
+      } finally {
+        done++;
+        const percent = Math.round((done / completedJobs.length) * 100);
+        setZipProgress({ phase: "downloading", done, total: completedJobs.length, percent });
+      }
+    }));
+
+    if (okCount === 0) {
+      logEvent({ type: "error", stage: "zip", message: `ZIP aborted: no videos downloaded` });
+      setZipProgress({ phase: "idle", done: 0, total: 0, percent: 0 });
+      return;
+    }
+
+    setZipProgress({ phase: "zipping", done: okCount, total: completedJobs.length, percent: 0 });
+    logEvent({ type: "info", stage: "zip", message: `Building ZIP (STORE) with ${okCount}/${completedJobs.length} videos…` });
+
+    const zipBlob = await zip.generateAsync(
+      { type: "blob", compression: "STORE", streamFiles: true },
+      (metadata) => {
+        setZipProgress((p) => ({ ...p, phase: "zipping", percent: Math.round(metadata.percent) }));
+      }
+    );
+
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(zipBlob);
+    link.download = `kling-batch-${Date.now()}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+
+    logEvent({ type: "success", stage: "zip", message: `ZIP: added ${okCount} of ${completedJobs.length} videos` });
+    setZipProgress({ phase: "done", done: okCount, total: completedJobs.length, percent: 100 });
+    setTimeout(() => setZipProgress({ phase: "idle", done: 0, total: 0, percent: 0 }), 2000);
+  }
+
+  const isProd = typeof import.meta !== "undefined" && import.meta.env?.PROD;
+  const showVercelSizeWarning = isProd && refVideoFileRef.current && refVideoFileRef.current.size > VERCEL_HOBBY_LIMIT;
 
   return (
     <div style={{ minHeight: "100vh", background: c.bg, color: c.text, fontFamily: font }}>
@@ -597,6 +740,9 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
         ::-webkit-scrollbar-track { background:${c.bg} }
         ::-webkit-scrollbar-thumb { background:${c.border};border-radius:3px }
         button { font-family:${font} }
+        select { font-family:${mono}; background:${c.surface}; color:${c.text}; border:1px solid ${c.border}; border-radius:5px; padding:7px 10px; font-size:11px; outline:none; width:100%; cursor:pointer; }
+        select:focus { border-color:${c.accent}; }
+        select:disabled { opacity:0.5; cursor:not-allowed; }
       `}</style>
 
       <div style={{ padding: "16px 24px", borderBottom: `1px solid ${c.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -604,7 +750,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
           <div style={{ width: 30, height: 30, borderRadius: 7, background: c.accent, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 700, color: "#fff" }}>K</div>
           <div>
             <div style={{ fontSize: 14, fontWeight: 600 }}>Kling Batch Motion Control</div>
-            <div style={{ fontSize: 10, color: c.hint, fontFamily: mono }}>v2.6 · PiAPI · fallback upload · runtime logs</div>
+            <div style={{ fontSize: 10, color: c.hint, fontFamily: mono }}>v2.6 · PiAPI · 0x0.st / Litterbox · concurrent pipeline</div>
           </div>
         </div>
         {!connected ? (
@@ -622,6 +768,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
 
       <div style={{ display: "flex", minHeight: "calc(100vh - 63px)" }}>
         <div style={{ width: 340, borderRight: `1px solid ${c.border}`, padding: 20, display: "flex", flexDirection: "column", gap: 14, overflowY: "auto" }}>
+          {/* Reference motion video */}
           <div>
             <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted, marginBottom: 6 }}>Reference motion video</div>
             {refVideoFileName && (
@@ -634,51 +781,26 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
             <div style={{ marginTop: 8 }}>
               <div style={{ fontSize: 9, color: c.muted, marginBottom: 4 }}>Upload video file:</div>
               <div
-                onClick={() => !running && document.getElementById('videoFileInput')?.click()}
-                onDragOver={(e) => { e.preventDefault(); if (!running) setIsVideoDragOver(true); }}
-                onDragEnter={(e) => { e.preventDefault(); if (!running) setIsVideoDragOver(true); }}
-                onDragLeave={(e) => { e.preventDefault(); if (!running) setIsVideoDragOver(false); }}
-                onDrop={async (e) => {
+                onClick={() => !running && document.getElementById("videoFileInput")?.click()}
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+                onDragEnter={(e) => {
                   e.preventDefault();
+                  if (running) return;
+                  videoDragCounter.current += 1;
+                  setIsVideoDragOver(true);
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  videoDragCounter.current = Math.max(0, videoDragCounter.current - 1);
+                  if (videoDragCounter.current === 0) setIsVideoDragOver(false);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  videoDragCounter.current = 0;
                   setIsVideoDragOver(false);
                   if (running) return;
-                  const file = e.dataTransfer.files[0];
-                  if (!file || !file.type.startsWith('video/')) return;
-                  
-                  // Validate video file size
-                  if (file.size > MAX_VIDEO_SIZE) {
-                    setRefVideoError(`Video file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_VIDEO_SIZE / 1024 / 1024}MB`);
-                    log("error", `Video file too large: ${file.name}`);
-                    return;
-                  }
-
-                  try {
-                    setRefVideoError("");
-                    log("info", `Uploading video file: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
-                    
-                    // Use FormData for direct file upload
-                    const formData = new FormData();
-                    formData.append('file', file);
-                    formData.append('action', 'upload_piapi');
-                    formData.append('apiKey', apiKey);
-
-                    const r = await fetch("/api/piapi", {
-                      method: "POST",
-                      body: formData,
-                    });
-
-                    const result = await r.json();
-                    const url = extractUploadUrl(result);
-                    if (!url) throw new Error("Upload failed - no URL returned");
-                    
-                    setRefVideoFileName(file.name);
-                    setRefVideoName(file.name);
-                    refVideoUrlRef.current = url;
-                    log("success", `Video uploaded: ${file.name}`);
-                  } catch (err) {
-                    setRefVideoError(err.message);
-                    log("error", `Video upload failed: ${err.message}`);
-                  }
+                  const file = e.dataTransfer.files?.[0];
+                  handleRefVideoFile(file);
                 }}
                 style={{
                   border: `1px dashed ${isVideoDragOver ? c.accent : c.border}`,
@@ -689,88 +811,126 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                   background: isVideoDragOver ? c.accent + "10" : c.surface,
                   fontSize: 10,
                   color: isVideoDragOver ? c.accent : c.muted,
-                  transition: "all 0.2s ease"
+                  transition: "all 0.2s ease",
                 }}
               >
                 {isVideoDragOver ? "Drop video file here" : "Click to select or drag & drop video file (MP4/MOV, max 50MB)"}
               </div>
-              <input id="videoFileInput" type="file" accept="video/mp4,video/mov" onChange={async (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
-                
-                // Validate video file size
-                if (file.size > MAX_VIDEO_SIZE) {
-                  setRefVideoError(`Video file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_VIDEO_SIZE / 1024 / 1024}MB`);
-                  log("error", `Video file too large: ${file.name}`);
+              <input
+                id="videoFileInput"
+                type="file"
+                accept="video/mp4,video/quicktime,.mp4,.mov"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
                   e.target.value = "";
-                  return;
-                }
-
-                try {
-                  setRefVideoError("");
-                  log("info", `Uploading video file: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
-                  
-                  // Use FormData for direct file upload
-                  const formData = new FormData();
-                  formData.append('file', file);
-                  formData.append('action', 'upload_piapi');
-                  formData.append('apiKey', apiKey);
-
-                  const r = await fetch("/api/piapi", {
-                    method: "POST",
-                    body: formData,
-                  });
-
-                  const result = await r.json();
-                  const url = extractUploadUrl(result);
-                  if (!url) throw new Error("Upload failed - no URL returned");
-                  
-                  setRefVideoFileName(file.name);
-                  setRefVideoName(file.name);
-                  refVideoUrlRef.current = url;
-                  log("success", `Video uploaded: ${file.name}`);
-                } catch (err) {
-                  setRefVideoError(err.message);
-                  log("error", `Video upload failed: ${err.message}`);
-                }
-                e.target.value = "";
-              }} disabled={running} style={{ display: 'none' }} />
+                  await handleRefVideoFile(file);
+                }}
+                disabled={running}
+                style={{ display: "none" }}
+              />
+              {showVercelSizeWarning && (
+                <div style={{ fontSize: 10, color: c.warn, marginTop: 6, lineHeight: 1.4 }}>
+                  Large file on Vercel: upload may fail on Hobby plan (4.5MB body limit). Consider Pro, or use a smaller video.
+                </div>
+              )}
             </div>
           </div>
 
-
-
-
-
-          <div style={{ background: c.surface, borderRadius: 7, border: `1px solid ${c.border}` }}>
-            <div style={{ padding: "8px 10px", borderBottom: `1px solid ${c.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontSize: 10, color: c.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em" }}>Runtime logs</div>
-              <button onClick={() => setLogs([])} style={{ border: `1px solid ${c.border}`, background: c.bg, borderRadius: 5, padding: "3px 8px", color: c.text, fontSize: 10, cursor: "pointer" }}>Clear</button>
-            </div>
-            <div style={{ maxHeight: 150, overflowY: "auto", padding: "8px 10px", display: "grid", gap: 4 }}>
-              {logs.length === 0 ? <div style={{ fontSize: 10, color: c.hint }}>No logs yet.</div> : logs.map((l) => (
-                <div key={l.id} style={{ fontSize: 10, fontFamily: mono, color: l.type === "error" ? c.error : l.type === "warn" ? c.warn : l.type === "success" ? c.success : c.muted }}>[{l.ts}] {l.message}</div>
+          {/* File host dropdown */}
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted, marginBottom: 6 }}>File host</div>
+            <select
+              value={uploadHost}
+              onChange={(e) => setUploadHost(e.target.value)}
+              disabled={running}
+            >
+              {HOST_OPTIONS.map((opt) => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
               ))}
+            </select>
+            <div style={{ fontSize: 9, color: c.hint, marginTop: 4 }}>
+              Used for both reference video and character images.
+            </div>
+          </div>
+
+          {/* Runtime logs */}
+          <div style={{ background: c.surface, borderRadius: 7, border: `1px solid ${c.border}` }}>
+            <div style={{ padding: "8px 10px", borderBottom: `1px solid ${c.border}`, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+              <div style={{ fontSize: 10, color: c.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em" }}>Runtime logs</div>
+              <div style={{ display: "flex", gap: 4 }}>
+                <label style={{ fontSize: 9, color: c.hint, display: "flex", alignItems: "center", gap: 3, fontFamily: mono, cursor: "pointer" }}>
+                  <input type="checkbox" checked={debugLogs} onChange={(e) => setDebugLogs(e.target.checked)} style={{ margin: 0 }} />
+                  debug
+                </label>
+                <button onClick={copyLogs} style={{ border: `1px solid ${c.border}`, background: c.bg, borderRadius: 5, padding: "3px 8px", color: c.text, fontSize: 10, cursor: "pointer" }}>Copy</button>
+                <button onClick={() => setLogs([])} style={{ border: `1px solid ${c.border}`, background: c.bg, borderRadius: 5, padding: "3px 8px", color: c.text, fontSize: 10, cursor: "pointer" }}>Clear</button>
+              </div>
+            </div>
+            <div style={{ padding: "6px 10px", borderBottom: `1px solid ${c.border}`, display: "flex", gap: 4, alignItems: "center" }}>
+              {["all", "info", "success", "warn", "error", "debug"].map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setLogFilter(f)}
+                  style={{
+                    border: `1px solid ${logFilter === f ? c.accent : c.border}`,
+                    background: logFilter === f ? c.accent + "20" : c.bg,
+                    color: logFilter === f ? c.accent : c.muted,
+                    borderRadius: 4,
+                    padding: "2px 6px",
+                    fontSize: 9,
+                    fontFamily: mono,
+                    cursor: "pointer",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {f}
+                </button>
+              ))}
+              <input
+                value={logSearch}
+                onChange={(e) => setLogSearch(e.target.value)}
+                placeholder="search…"
+                style={{ flex: 1, marginLeft: 4, background: c.bg, border: `1px solid ${c.border}`, borderRadius: 4, padding: "2px 6px", color: c.text, fontSize: 10, fontFamily: mono, outline: "none" }}
+              />
+            </div>
+            <div
+              ref={logsContainerRef}
+              onScroll={handleLogsScroll}
+              style={{ maxHeight: 200, overflowY: "auto", padding: "8px 10px", display: "grid", gap: 4 }}
+            >
+              {filteredLogs.length === 0 ? (
+                <div style={{ fontSize: 10, color: c.hint }}>No logs.</div>
+              ) : (
+                filteredLogs.map((l) => <LogEntry key={l.id} entry={l} />)
+              )}
               <div ref={logsEndRef} />
             </div>
           </div>
 
+          {/* Character images */}
           <div>
             <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted, marginBottom: 6 }}>Character images ({images.length})</div>
             <div
               onClick={() => !running && imgRef.current?.click()}
-              onDragOver={(e) => { e.preventDefault(); if (!running) setIsImageDragOver(true); }}
-              onDragEnter={(e) => { e.preventDefault(); if (!running) setIsImageDragOver(true); }}
-              onDragLeave={(e) => { e.preventDefault(); if (!running) setIsImageDragOver(false); }}
-              onDrop={async (e) => {
+              onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+              onDragEnter={(e) => {
                 e.preventDefault();
+                if (running) return;
+                imageDragCounter.current += 1;
+                setIsImageDragOver(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                imageDragCounter.current = Math.max(0, imageDragCounter.current - 1);
+                if (imageDragCounter.current === 0) setIsImageDragOver(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                imageDragCounter.current = 0;
                 setIsImageDragOver(false);
                 if (running) return;
-                const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
-                if (files.length === 0) return;
-                const items = await Promise.all(files.map(async (f) => ({ name: f.name, file: f, preview: await fileToPreview(f) })));
-                setImages((p) => [...p, ...items]);
-                log("info", `Added ${files.length} image(s) via drag & drop`);
+                const files = Array.from(e.dataTransfer.files || []);
+                handleImageFiles(files);
               }}
               style={{
                 border: `1px dashed ${isImageDragOver ? c.accent : c.border}`,
@@ -780,22 +940,37 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                 cursor: running ? "default" : "pointer",
                 background: isImageDragOver ? c.accent + "10" : c.surface,
                 marginBottom: 6,
-                transition: "all 0.2s ease"
+                transition: "all 0.2s ease",
               }}
             >
-              <input ref={imgRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={handleImages} />
+              <input
+                ref={imgRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                multiple
+                onChange={async (e) => {
+                  const files = Array.from(e.target.files || []);
+                  e.target.value = "";
+                  await handleImageFiles(files);
+                }}
+              />
               <div style={{ fontSize: 11, color: isImageDragOver ? c.accent : c.muted }}>
                 {isImageDragOver ? "Drop images here" : "Click to select or drag & drop images"}
               </div>
             </div>
-            {images.length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>{images.map((img, i) => (
-              <div key={i} style={{ position: "relative", width: 44, height: 44 }}>
-                <img src={img.preview} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 5, border: `1px solid ${c.border}` }} />
-                {!running && <button onClick={(e) => { e.stopPropagation(); removeImage(i); }} style={{ position: "absolute", top: -3, right: -3, width: 14, height: 14, borderRadius: "50%", background: c.error, border: "none", color: "#fff", fontSize: 8, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>×</button>}
+            {images.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                {images.map((img, i) => (
+                  <div key={i} style={{ position: "relative", width: 44, height: 44 }}>
+                    <img src={img.preview} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 5, border: `1px solid ${c.border}` }} />
+                    {!running && <button onClick={(e) => { e.stopPropagation(); removeImage(i); }} style={{ position: "absolute", top: -3, right: -3, width: 14, height: 14, borderRadius: "50%", background: c.error, border: "none", color: "#fff", fontSize: 8, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>×</button>}
+                  </div>
+                ))}
               </div>
-            ))}</div>}
+            )}
           </div>
 
+          {/* Settings */}
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted }}>Settings</div>
             <div style={{ display: "flex", gap: 6 }}>
@@ -824,8 +999,13 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                 </button>
               ))}
             </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: c.muted, cursor: running ? "default" : "pointer" }}>
+              <input type="checkbox" checked={keepSound} onChange={(e) => !running && setKeepSound(e.target.checked)} disabled={running} />
+              Keep original sound
+            </label>
           </div>
 
+          {/* Cost estimate */}
           <div style={{ background: c.surface, borderRadius: 7, padding: 12, border: `1px solid ${c.border}` }}>
             <div style={{ fontSize: 10, color: c.muted, marginBottom: 6, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em" }}>Cost estimate</div>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}><span style={{ fontSize: 11, color: c.muted }}>Per video ({videoDuration}s)</span><span style={{ fontSize: 11, fontFamily: mono }}>${perVideo.toFixed(2)}</span></div>
@@ -845,7 +1025,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
           {jobs.length === 0 ? (
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "50vh", color: c.muted, fontSize: 12, flexDirection: "column", gap: 6 }}>
               <div style={{ fontSize: 28, opacity: 0.25 }}>⬡</div>
-              <div>Paste a reference video URL and upload character images to start</div>
+              <div>Drop a reference MP4/MOV and character images to start</div>
             </div>
           ) : (
             <>
@@ -855,73 +1035,11 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                 ))}
                 <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
                   {completedCount > 0 && (
-                    <button 
-                      onClick={async () => {
-                        if (isDownloadingZip) return;
-                        
-                        setIsDownloadingZip(true);
-                        const completedJobs = jobs.filter(j => j.status === "completed");
-                        log("info", `Creating ZIP with ${completedJobs.length} videos...`);
-
-                        const zip = new JSZip();
-                        const folder = zip.folder("kling-batch-videos");
-
-                        // Download all videos and add to ZIP
-                        for (let i = 0; i < completedJobs.length; i++) {
-                          const job = completedJobs[i];
-                          try {
-                            log("info", `Downloading ${i + 1}/${completedJobs.length}: ${job.imageName}`);
-                            const response = await fetch(proxyDownload(job));
-                            const blob = await response.blob();
-                            const fileName = safeDownloadName(job);
-                            folder.file(fileName, blob);
-                            log("success", `Added ${fileName} to ZIP (${i + 1}/${completedJobs.length})`);
-                          } catch (err) {
-                            log("error", `Failed to add ${job.imageName} to ZIP: ${err.message}`);
-                          }
-                        }
-
-                        // Generate and download ZIP
-                        log("info", "Generating ZIP file...");
-                        const zipBlob = await zip.generateAsync({ type: "blob" });
-                        const link = document.createElement('a');
-                        link.href = URL.createObjectURL(zipBlob);
-                        link.download = `kling-batch-${Date.now()}.zip`;
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                        URL.revokeObjectURL(link.href);
-
-                        log("success", `ZIP download created with ${completedJobs.length} videos`);
-                        setIsDownloadingZip(false);
-                      }} 
-                      disabled={isDownloadingZip}
-                      style={{ 
-                        padding: "6px 12px", 
-                        borderRadius: 5, 
-                        background: isDownloadingZip ? c.tag : c.success, 
-                        border: "none", 
-                        color: "#fff", 
-                        fontSize: 11, 
-                        fontWeight: 600, 
-                        cursor: isDownloadingZip ? "default" : "pointer",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6
-                      }}
-                    >
-                      {isDownloadingZip && (
-                        <span style={{ 
-                          width: 10, 
-                          height: 10, 
-                          border: "2px solid #fff", 
-                          borderTopColor: "transparent", 
-                          borderRadius: "50%", 
-                          animation: "spin 0.6s linear infinite" 
-                        }} />
-                      )}
-                      {isDownloadingZip ? "Creating ZIP..." : `Download ZIP (${completedCount})`}
-                    </button>
+                    <ZipButton
+                      count={completedCount}
+                      progress={zipProgress}
+                      onClick={downloadAllZip}
+                    />
                   )}
                   <div style={{ fontSize: 11, fontFamily: mono, color: c.accent }}>Spent: ${spent.toFixed(2)}</div>
                 </div>
@@ -941,15 +1059,10 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                       {job.uploadProviderUsed && <div style={{ fontSize: 9, color: c.hint, fontFamily: mono, marginBottom: 4 }}>Upload: {job.uploadProviderUsed}</div>}
 
                       {job.status === "failed" && (
-                        <div style={{ marginTop: 8 }}>
-                          <div style={{ fontSize: 10, color: c.error, lineHeight: 1.4, padding: "6px 8px", background: c.error + "12", borderRadius: 4, border: `1px solid ${c.error}30`, marginBottom: 8 }}>{job.error || "Unknown error"}</div>
-                          <div style={{ display: "flex", gap: 5 }}>
-                            <button onClick={() => retryJob(job.id)} style={{ flex: 1, padding: "7px 0", borderRadius: 5, background: c.accent, border: "none", color: "#fff", fontSize: 10, fontWeight: 600, cursor: "pointer" }}>Retry</button>
-                            <button onClick={() => replaceImgRefs.current[job.id]?.click()} style={{ flex: 1, padding: "7px 0", borderRadius: 5, background: c.surface, border: `1px solid ${c.border}`, color: c.text, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>Replace</button>
-                            <input ref={(el) => { replaceImgRefs.current[job.id] = el; }} type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => { const f = e.target.files[0]; if (f) replaceAndRetry(job.id, f); e.target.value = ""; }} />
-                          </div>
-                        </div>
+                        <JobError job={job} onRetry={() => retryJob(job.id)} onReplace={() => replaceImgRefs.current[job.id]?.click()} />
                       )}
+
+                      <input ref={(el) => { replaceImgRefs.current[job.id] = el; }} type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" onChange={(e) => { const f = e.target.files?.[0]; if (f) replaceAndRetry(job.id, f); e.target.value = ""; }} />
 
                       {job.videoUrl && (
                         <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
@@ -957,8 +1070,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                             <a href={proxyDownload(job)} download={safeDownloadName(job)} style={{ flex: 1, textAlign: "center", padding: "7px 0", borderRadius: 5, background: c.accent + "18", color: c.accent, fontSize: 10, fontWeight: 600, textDecoration: "none", border: `1px solid ${c.accent}30` }}>Download</a>
                             <button onClick={() => {
                               updateJob(job.id, { status: "uploading", videoUrl: null, taskId: null, error: null });
-                              const activeVideoUrl = taskVideoUrlRef.current || refVideoUrlRef.current;
-                              submitSingleJob(job, activeVideoUrl);
+                              submitSingleJob(job, refVideoUrlRef.current, { forceReupload: true });
                               if (!pollRef.current) startPolling();
                               log("info", `Regenerating video for ${job.imageName}`);
                             }} style={{ flex: 1, padding: "7px 0", borderRadius: 5, background: c.warn + "20", border: `1px solid ${c.warn}40`, color: c.warn, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>Regenerate</button>
@@ -975,6 +1087,94 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
         </div>
       </div>
       <Analytics />
+    </div>
+  );
+}
+
+function ZipButton({ count, progress, onClick }) {
+  const busy = progress.phase === "downloading" || progress.phase === "zipping";
+  let label = `Download ZIP (${count})`;
+  if (progress.phase === "downloading") label = `Downloading ${progress.done}/${progress.total} (${progress.percent}%)`;
+  else if (progress.phase === "zipping") label = `Zipping ${progress.percent}%`;
+  else if (progress.phase === "done") label = `ZIP ready`;
+
+  const percent = progress.percent || 0;
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      style={{
+        position: "relative",
+        padding: "6px 12px",
+        borderRadius: 5,
+        background: busy ? c.tag : c.success,
+        border: "none",
+        color: "#fff",
+        fontSize: 11,
+        fontWeight: 600,
+        cursor: busy ? "default" : "pointer",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        overflow: "hidden",
+        minWidth: 160,
+      }}
+    >
+      {busy && (
+        <span
+          style={{
+            position: "absolute",
+            left: 0, top: 0, bottom: 0,
+            width: `${percent}%`,
+            background: c.accent + "55",
+            transition: "width 0.2s ease",
+            zIndex: 0,
+          }}
+        />
+      )}
+      <span style={{ position: "relative", zIndex: 1, display: "flex", alignItems: "center", gap: 6 }}>
+        {busy && (
+          <span style={{ width: 10, height: 10, border: "2px solid #fff", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.6s linear infinite" }} />
+        )}
+        {label}
+      </span>
+    </button>
+  );
+}
+
+function JobError({ job, onRetry, onReplace }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 10, color: c.error, lineHeight: 1.4, padding: "6px 8px", background: c.error + "12", borderRadius: 4, border: `1px solid ${c.error}30`, marginBottom: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 6 }}>
+          <span style={{ flex: 1, wordBreak: "break-word" }}>{job.error || "Unknown error"}</span>
+          <button
+            onClick={() => setOpen((v) => !v)}
+            style={{ background: "transparent", border: "none", color: c.error, fontSize: 10, cursor: "pointer", padding: 0, fontFamily: mono }}
+          >
+            {open ? "\u25BE" : "\u25B8"}
+          </button>
+        </div>
+        {open && (
+          <div style={{ marginTop: 6, display: "grid", gap: 4 }}>
+            <pre style={{ margin: 0, fontSize: 9, fontFamily: mono, color: c.text, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 160, overflow: "auto" }}>
+              {String(job.error || "")}
+            </pre>
+            <button
+              onClick={() => { navigator.clipboard?.writeText(String(job.error || "")); }}
+              style={{ alignSelf: "flex-start", background: "transparent", border: `1px solid ${c.error}40`, color: c.error, fontSize: 9, padding: "2px 6px", borderRadius: 3, cursor: "pointer", fontFamily: mono }}
+            >
+              Copy error
+            </button>
+          </div>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 5 }}>
+        <button onClick={onRetry} style={{ flex: 1, padding: "7px 0", borderRadius: 5, background: c.accent, border: "none", color: "#fff", fontSize: 10, fontWeight: 600, cursor: "pointer" }}>Retry</button>
+        <button onClick={onReplace} style={{ flex: 1, padding: "7px 0", borderRadius: 5, background: c.surface, border: `1px solid ${c.border}`, color: c.text, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>Replace</button>
+      </div>
     </div>
   );
 }
