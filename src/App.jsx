@@ -130,31 +130,18 @@ export default function App() {
 
   // Upload to tmpfiles.org (avoids CORS and size limits)
   async function uploadFile(file) {
-    // Try tmpfiles.org first, fall back to tmpfile.link
-    const hosts = [
-      {
-        url: "https://tmpfiles.org/api/v1/upload",
-        getLink: (d) => d?.data?.url?.replace("tmpfiles.org/", "tmpfiles.org/dl/"),
-      },
-      {
-        url: "https://tmpfile.link/api/upload",
-        getLink: (d) => d?.downloadLink,
-      },
-    ];
-    for (const host of hosts) {
-      try {
-        const fd = new FormData();
-        fd.append("file", file);
-        const r = await fetch(host.url, { method: "POST", body: fd });
-        if (!r.ok) continue;
-        const d = await r.json();
-        const link = host.getLink(d);
-        if (link) return link;
-      } catch (_) {
-        continue;
-      }
-    }
-    throw new Error("All file hosts failed");
+    const base64 = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(",")[1]);
+      reader.readAsDataURL(file);
+    });
+    const d = await proxy({
+      action: "upload",
+      file_name: file.name,
+      file_data: base64,
+    });
+    if (d?.data?.url) return d.data.url;
+    throw new Error(d?.message || d?.error || "File upload failed");
   }
 
   // Proxy for PiAPI calls (avoids CORS)
