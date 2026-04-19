@@ -130,20 +130,41 @@ export default function App() {
 
   // Upload to tmpfiles.org (avoids CORS and size limits)
   async function uploadFile(file) {
+    const compressed = await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 2048;
+        let w = img.width;
+        let h = img.height;
+        if (w > maxDim || h > maxDim) {
+          if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+          else { w = Math.round(w * maxDim / h); h = maxDim; }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        canvas.toBlob((blob) => {
+          const name = file.name.replace(/\.\w+$/, "") + ".jpg";
+          resolve(new File([blob], name, { type: "image/jpeg" }));
+        }, "image/jpeg", 0.85);
+      };
+      img.src = URL.createObjectURL(file);
+    });
     const base64 = await new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result.split(",")[1]);
-      reader.readAsDataURL(file);
+      reader.readAsDataURL(compressed);
     });
     const d = await proxy({
       action: "upload",
-      file_name: file.name,
+      file_name: compressed.name,
       file_data: base64,
     });
     if (d?.data?.url) return d.data.url;
     throw new Error(d?.message || d?.error || "File upload failed");
   }
-
   // Proxy for PiAPI calls (avoids CORS)
   async function proxy(body) {
     const r = await fetch("/api/piapi", {
