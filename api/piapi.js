@@ -76,12 +76,13 @@ const PROXY_FAIL_STATUSES = new Set([407, 429, 502, 503, 504]);
 function classifyProxyFailure(err, status) {
   const code = err?.cause?.code || err?.code || '';
   const msg = err?.cause?.message || err?.message || '';
-  if (PROXY_FAIL_CODES.has(code)) return { proxyFailed: true, code };
-  if (PROXY_FAIL_STATUSES.has(status)) return { proxyFailed: true, code: code || undefined };
+  const detail = [err?.message, err?.cause?.message].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(' | ');
+  if (PROXY_FAIL_CODES.has(code)) return { proxyFailed: true, code, detail };
+  if (PROXY_FAIL_STATUSES.has(status)) return { proxyFailed: true, code: code || undefined, detail };
   if (/^SOCKS\b/i.test(msg) || /socks/i.test(err?.name || '')) {
-    return { proxyFailed: true, code: code || 'SOCKS_ERROR' };
+    return { proxyFailed: true, code: code || 'SOCKS_ERROR', detail };
   }
-  return { proxyFailed: false, code: code || undefined };
+  return { proxyFailed: false, code: code || undefined, detail };
 }
 
 function makeDispatcher(proxyUrl) {
@@ -280,9 +281,9 @@ export default async function handler(req, res) {
         }
         return res.status(r.status).json(d);
       } catch (err) {
-        const { proxyFailed, code } = classifyProxyFailure(err, 0);
+        const { proxyFailed, code, detail } = classifyProxyFailure(err, 0);
         return res.status(proxyFailed ? 502 : 500).json({
-          error: err.message,
+          error: detail || err.message,
           proxyFailed: Boolean(proxyUrl) && proxyFailed,
           code,
         });
@@ -339,10 +340,10 @@ export default async function handler(req, res) {
         });
       } catch (err) {
         const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 502;
-        const { proxyFailed, code } = classifyProxyFailure(err, status);
+        const { proxyFailed, code, detail } = classifyProxyFailure(err, status);
         const pf = Boolean(proxyUrl) && proxyFailed;
         return res.status(pf ? 502 : status).json({
-          error: err.message,
+          error: detail || err.message,
           host: chosenHost,
           body: err.body || null,
           proxyFailed: pf,
