@@ -1,5 +1,9 @@
+import formidable from 'formidable';
+
 export const config = {
-  api: { bodyParser: { sizeLimit: '10mb' } },
+  api: { 
+    bodyParser: false, // Disable default body parser to handle both JSON and FormData
+  },
 };
 
 async function readAsJsonOrText(response) {
@@ -48,6 +52,40 @@ async function resolveFilebinDirectUrl(filebinUrl) {
   return null;
 }
 
+// Parse request body (JSON or FormData)
+async function parseRequestBody(req) {
+  const contentType = req.headers['content-type'] || '';
+  
+  if (contentType.includes('multipart/form-data')) {
+    // Parse FormData
+    return new Promise((resolve, reject) => {
+      const form = formidable({ 
+        maxFileSize: 100 * 1024 * 1024, // 100MB limit for direct file uploads
+        keepExtensions: true,
+      });
+      
+      form.parse(req, (err, fields, files) => {
+        if (err) return reject(err);
+        resolve({ fields, files, isFormData: true });
+      });
+    });
+  } else {
+    // Parse JSON
+    return new Promise((resolve, reject) => {
+      let body = '';
+      req.on('data', chunk => { body += chunk.toString(); });
+      req.on('end', () => {
+        try {
+          resolve({ body: JSON.parse(body), isFormData: false });
+        } catch (err) {
+          reject(err);
+        }
+      });
+      req.on('error', reject);
+    });
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     const { action, url, filename } = req.query || {};
@@ -82,9 +120,21 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { action, apiKey, ...payload } = req.body;
+  // Parse request body
+  const parsed = await parseRequestBody(req);
+  let action, apiKey, payload;
 
-  const needsApiKey = ["create", "poll", "upload_piapi", "upload_temp_sh"].includes(action);
+  if (parsed.isFormData) {
+    // FormData request
+    action = parsed.fields.action?.[0] || parsed.fields.action;
+    apiKey = parsed.fields.apiKey?.[0] || parsed.fields.apiKey;
+    payload = { fields: parsed.fields, files: parsed.files };
+  } else {
+    // JSON request
+    ({ action, apiKey, ...payload } = parsed.body);
+  }
+
+  const needsApiKey = ["create", "poll", "upload_piapi", "upload_filebin"].includes(action);
   if (needsApiKey && !apiKey) {
     return res.status(400).json({ error: "Missing API key" });
   }
@@ -110,136 +160,201 @@ export default async function handler(req, res) {
       const d = await r.json();
       return res.status(r.status).json(d);
     } else if (action === "upload_piapi") {
-      if (!payload.file_name || !payload.file_data) {
-        return res.status(400).json({ error: "Missing file_name or file_data" });
-      }
+      // Handle direct file upload via FormData
+      if (parsed.isFormData) {
+        const file = payload.files.file?.[0] || payload.files.file;
+        if (!file) {
+          return res.status(400).json({ error: "Missing file in FormData" });
+        }
 
-      const r = await fetch("https://upload.theapi.app/api/ephemeral_resource", {
-        method: "POST",
-        headers: {
-          "x-api-key": apiKey,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          file_name: String(payload.file_name),
-          file_data: String(payload.file_data),
-        }),
-      });
+        const fs = await import('fs');
+        const fileBuffer = await fs.promises.readFile(file.filepath);
+        const base64Data = fileBuffer.toString('base64');
 
-      const { json, text } = await readAsJsonOrText(r);
-      if (!r.ok) {
-        return res.status(r.status).json({
-          error: json?.message || json?.error || text || "piapi upload failed",
+        const r = await fetch("https://upload.theapi.app/api/ephemeral_resource", {
+          method: "POST",
+          headers: {
+            "x-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            file_name: file.originalFilename || file.newFilename,
+            file_data: base64Data,
+          }),
+        });
+
+        const { json, text } = await readAsJsonOrText(r);
+        
+        // Clean up temp file
+        try {
+          await fs.promises.unlink(file.filepath);
+        } catch (_) {}
+
+        if (!r.ok) {
+          return res.status(r.status).json({
+            error: json?.message || json?.error || text || "piapi upload failed",
+            raw: json || text,
+          });
+        }
+
+        const uploadedUrl = json?.data?.url || json?.url || "";
+
+        if (!uploadedUrl) {
+          return res.status(502).json({
+            error: "piapi upload returned invalid response",
+            raw: json || text,
+          });
+        }
+
+        return res.status(200).json({
+          data: {
+            fileName: file.originalFilename || file.newFilename,
+            downloadLink: uploadedUrl,
+            downloadLinkEncoded: uploadedUrl,
+            uploadedTo: "piapi_ephemeral_resource",
+            type: file.mimetype || "application/octet-stream",
+          },
+          raw: json || text,
+        });
+      } else {
+        // Legacy base64 upload (fallback)
+        if (!payload.file_name || !payload.file_data) {
+          return res.status(400).json({ error: "Missing file_name or file_data" });
+        }
+
+        const r = await fetch("https://upload.theapi.app/api/ephemeral_resource", {
+          method: "POST",
+          headers: {
+            "x-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            file_name: String(payload.file_name),
+            file_data: String(payload.file_data),
+          }),
+        });
+
+        const { json, text } = await readAsJsonOrText(r);
+        if (!r.ok) {
+          return res.status(r.status).json({
+            error: json?.message || json?.error || text || "piapi upload failed",
+            raw: json || text,
+          });
+        }
+
+        const uploadedUrl = json?.data?.url || json?.url || "";
+
+        if (!uploadedUrl) {
+          return res.status(502).json({
+            error: "piapi upload returned invalid response",
+            raw: json || text,
+          });
+        }
+
+        return res.status(200).json({
+          data: {
+            fileName: String(payload.file_name),
+            downloadLink: uploadedUrl,
+            downloadLinkEncoded: uploadedUrl,
+            uploadedTo: "piapi_ephemeral_resource",
+            type: String(payload.file_type || "application/octet-stream"),
+          },
           raw: json || text,
         });
       }
-
-      const uploadedUrl =
-        json?.data?.url ||
-        json?.url ||
-        "";
-
-      if (!uploadedUrl) {
-        return res.status(502).json({
-          error: "piapi upload returned invalid response",
-          raw: json || text,
-        });
-      }
-
-      return res.status(200).json({
-        data: {
-          fileName: String(payload.file_name),
-          downloadLink: uploadedUrl,
-          downloadLinkEncoded: uploadedUrl,
-          uploadedTo: "piapi_ephemeral_resource",
-          type: String(payload.file_type || "application/octet-stream"),
-        },
-        raw: json || text,
-      });
-    } else if (action === "upload_temp_sh") {
-      if (!payload.file_name || !payload.file_data) {
-        return res.status(400).json({ error: "Missing file_name or file_data" });
-      }
-
-      const binData = Buffer.from(String(payload.file_data), "base64");
-      const uploadUrl = `https://temp.sh/upload`;
-
-      const form = new FormData();
-      form.append("file", new Blob([binData], { type: payload.file_type || "application/octet-stream" }), payload.file_name);
-
-      const r = await fetch(uploadUrl, {
-        method: "POST",
-        body: form,
-      });
-
-      const { json, text } = await readAsJsonOrText(r);
-      if (!r.ok) {
-        return res.status(r.status).json({
-          error: json?.error || json?.message || text || "temp.sh upload failed",
-          raw: json || text,
-        });
-      }
-
-      // temp.sh returns the URL directly in the response body
-      const uploadedUrl = (text || "").trim();
-      if (!uploadedUrl || !uploadedUrl.startsWith("https://temp.sh/")) {
-        return res.status(502).json({
-          error: "temp.sh returned invalid URL",
-          raw: text,
-        });
-      }
-
-      return res.status(200).json({
-        data: {
-          fileName: String(payload.file_name),
-          downloadLink: uploadedUrl,
-          downloadLinkEncoded: uploadedUrl,
-          uploadedTo: "temp_sh",
-          type: String(payload.file_type || "application/octet-stream"),
-        },
-        raw: text,
-      });
     } else if (action === "upload_filebin") {
-      if (!payload.file_name || !payload.file_data) {
-        return res.status(400).json({ error: "Missing file_name or file_data" });
-      }
+      // Handle direct file upload via FormData
+      if (parsed.isFormData) {
+        const file = payload.files.file?.[0] || payload.files.file;
+        if (!file) {
+          return res.status(400).json({ error: "Missing file in FormData" });
+        }
 
-      const binData = Buffer.from(String(payload.file_data), "base64");
-      const mime = String(payload.file_type || "application/octet-stream");
-      const fileName = String(payload.file_name);
-      const filebinName = payload.filebin_name || `kling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const fs = await import('fs');
+        const fileBuffer = await fs.promises.readFile(file.filepath);
+        const fileName = file.originalFilename || file.newFilename;
+        const mime = file.mimetype || "application/octet-stream";
+        const filebinName = `kling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-      const uploadUrl = `https://filebin.net/${encodeURIComponent(filebinName)}/${encodeURIComponent(fileName)}`;
-      const r = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": mime },
-        body: binData,
-      });
-
-      const { json, text } = await readAsJsonOrText(r);
-      const normalized = normalizeFilebinPayload(json, filebinName, fileName, mime, binData.length);
-
-      if (!r.ok) {
-        return res.status(r.status).json({
-          error: json?.error || json?.message || text || "filebin upload failed",
-          raw: json || text,
+        const uploadUrl = `https://filebin.net/${encodeURIComponent(filebinName)}/${encodeURIComponent(fileName)}`;
+        const r = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": mime },
+          body: fileBuffer,
         });
-      }
 
-      if (!normalized?.downloadLink && !normalized?.downloadLinkEncoded) {
-        return res.status(502).json({
-          error: "filebin returned invalid response",
-          raw: json || text,
+        // Clean up temp file
+        try {
+          await fs.promises.unlink(file.filepath);
+        } catch (_) {}
+
+        const { json, text } = await readAsJsonOrText(r);
+        const normalized = normalizeFilebinPayload(json, filebinName, fileName, mime, fileBuffer.length);
+
+        if (!r.ok) {
+          return res.status(r.status).json({
+            error: json?.error || json?.message || text || "filebin upload failed",
+            raw: json || text,
+          });
+        }
+
+        if (!normalized?.downloadLink && !normalized?.downloadLinkEncoded) {
+          return res.status(502).json({
+            error: "filebin returned invalid response",
+            raw: json || text,
+          });
+        }
+
+        const directUrl = await resolveFilebinDirectUrl(normalized.viewLink || normalized.downloadLinkEncoded || normalized.downloadLink);
+        if (directUrl) {
+          normalized.downloadLink = directUrl;
+          normalized.downloadLinkEncoded = directUrl;
+        }
+
+        return res.status(200).json({ data: normalized, raw: json || text });
+      } else {
+        // Legacy base64 upload (fallback)
+        if (!payload.file_name || !payload.file_data) {
+          return res.status(400).json({ error: "Missing file_name or file_data" });
+        }
+
+        const binData = Buffer.from(String(payload.file_data), "base64");
+        const mime = String(payload.file_type || "application/octet-stream");
+        const fileName = String(payload.file_name);
+        const filebinName = payload.filebin_name || `kling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        const uploadUrl = `https://filebin.net/${encodeURIComponent(filebinName)}/${encodeURIComponent(fileName)}`;
+        const r = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": mime },
+          body: binData,
         });
-      }
 
-      const directUrl = await resolveFilebinDirectUrl(normalized.viewLink || normalized.downloadLinkEncoded || normalized.downloadLink);
-      if (directUrl) {
-        normalized.downloadLink = directUrl;
-        normalized.downloadLinkEncoded = directUrl;
-      }
+        const { json, text } = await readAsJsonOrText(r);
+        const normalized = normalizeFilebinPayload(json, filebinName, fileName, mime, binData.length);
 
-      return res.status(200).json({ data: normalized, raw: json || text });
+        if (!r.ok) {
+          return res.status(r.status).json({
+            error: json?.error || json?.message || text || "filebin upload failed",
+            raw: json || text,
+          });
+        }
+
+        if (!normalized?.downloadLink && !normalized?.downloadLinkEncoded) {
+          return res.status(502).json({
+            error: "filebin returned invalid response",
+            raw: json || text,
+          });
+        }
+
+        const directUrl = await resolveFilebinDirectUrl(normalized.viewLink || normalized.downloadLinkEncoded || normalized.downloadLink);
+        if (directUrl) {
+          normalized.downloadLink = directUrl;
+          normalized.downloadLinkEncoded = directUrl;
+        }
+
+        return res.status(200).json({ data: normalized, raw: json || text });
+      }
     } else if (action === "fetch_video") {
       if (!payload.url) {
         return res.status(400).json({ error: "Missing url" });
@@ -287,4 +402,8 @@ export default async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
+}
+
+function isReachableStatus(status) {
+  return status >= 200 && status < 500;
 }

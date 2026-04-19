@@ -5,7 +5,8 @@ import JSZip from "jszip";
 const POLL_INTERVAL = 8000;
 const MAX_AUTO_RETRIES = 3;
 const STORAGE_API_KEY = "kling_batch_api_key";
-const INLINE_IMAGE_MAX_BYTES = 1.5 * 1024 * 1024;
+const MAX_VIDEO_SIZE = 50 * 1024 * 1024; // 50MB max for video files
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB max for image files
 
 const font = `'DM Sans', sans-serif`;
 const mono = `'JetBrains Mono', 'Fira Code', monospace`;
@@ -104,132 +105,8 @@ function safeBase(name) {
   );
 }
 
-function readImage(file) {
-  return new Promise((resolve, reject) => {
-    const src = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(src);
-      resolve(img);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(src);
-      reject(new Error("Invalid image"));
-    };
-    img.src = src;
-  });
-}
-
-function canvasBlob(canvas, type, quality = 0.92) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) return reject(new Error("Canvas conversion failed"));
-      resolve(blob);
-    }, type, quality);
-  });
-}
-
-async function convertImageFormat(file) {
-  const img = await readImage(file);
-  const canvas = document.createElement("canvas");
-  canvas.width = img.width;
-  canvas.height = img.height;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0);
-
-  const isPng = file.type === "image/png" || file.name.toLowerCase().endsWith(".png");
-  const outType = isPng ? "image/jpeg" : "image/png";
-  const ext = isPng ? ".jpg" : ".png";
-  const blob = await canvasBlob(canvas, outType);
-  return new File([blob], `${safeBase(file.name)}_v2${ext}`, { type: outType });
-}
-
-async function resizeImage(file, scale) {
-  const img = await readImage(file);
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(img.width * scale);
-  canvas.height = Math.round(img.height * scale);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-  const isPng = file.type === "image/png" || file.name.toLowerCase().endsWith(".png");
-  const outType = isPng ? "image/png" : "image/jpeg";
-  const ext = isPng ? ".png" : ".jpg";
-  const blob = await canvasBlob(canvas, outType);
-  return new File([blob], `${safeBase(file.name)}_v3${ext}`, { type: outType });
-}
-
-async function compressForUpload(file, { maxEdge = 1024, quality = 0.7 } = {}) {
-  const img = await readImage(file);
-  const max = maxEdge;
-  let w = img.width;
-  let h = img.height;
-  if (w > max || h > max) {
-    if (w > h) {
-      h = Math.round((h * max) / w);
-      w = max;
-    } else {
-      w = Math.round((w * max) / h);
-      h = max;
-    }
-  }
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, w, h);
-  const blob = await canvasBlob(canvas, "image/jpeg", quality);
-  return new File([blob], `${safeBase(file.name)}.jpg`, { type: "image/jpeg" });
-}
-
-function fileToB64(file) {
-  return new Promise((resolve) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(fr.result.split(",")[1]);
-    fr.readAsDataURL(file);
-  });
-}
-
-async function prepareImageInputForKling(file, { inline = false } = {}) {
-  const attempts = [
-    { maxEdge: 2048, quality: 0.85 },
-    { maxEdge: 1600, quality: 0.8 },
-    { maxEdge: 1280, quality: 0.75 },
-    { maxEdge: 1024, quality: 0.7 },
-  ];
-
-  let lastCompressed = null;
-  let lastRatio = null;
-
-  for (const cfg of attempts) {
-    const compressed = await compressForUpload(file, cfg);
-    const img = await readImage(compressed);
-    const ratio = img.width / img.height;
-    lastCompressed = compressed;
-    lastRatio = ratio;
-
-    if (ratio < 1 / 2.5 || ratio > 2.5) continue;
-    if (compressed.size > 10 * 1024 * 1024) continue;
-    if (inline && compressed.size > INLINE_IMAGE_MAX_BYTES) continue;
-
-    const base64 = await fileToB64(compressed); // raw base64, no data: prefix
-    return { base64, compressed, ratio };
-  }
-
-  if (lastRatio != null && (lastRatio < 1 / 2.5 || lastRatio > 2.5)) {
-    throw new Error("Image aspect ratio must be between 1:2.5 and 2.5:1");
-  }
-
-  if (inline) {
-    throw new Error("Image too large for inline fallback mode. Use URL upload path or reduce image size.");
-  }
-
-  if (lastCompressed?.size > 10 * 1024 * 1024) {
-    throw new Error("Image exceeds 10MB limit after processing");
-  }
-
-  throw new Error("Unable to prepare image for Kling input");
-}
+// Removed: All compression and base64 conversion functions
+// Files are now uploaded directly via FormData without compression
 
 function StatusBadge({ status, retries }) {
   const map = {
@@ -337,32 +214,36 @@ export default function App() {
     );
   }
 
-  async function uploadFile(fileOrData, jobId) {
-    let file_name, file_type, file_data;
-
-    if (fileOrData instanceof File) {
-      // Legacy: file object
-      file_name = fileOrData.name;
-      file_type = fileOrData.type;
-      file_data = await fileToB64(fileOrData);
-    } else {
-      // New: pre-processed data object
-      file_name = fileOrData.name;
-      file_type = fileOrData.type;
-      file_data = fileOrData.base64;
+  async function uploadFile(file, jobId) {
+    // Validate file size
+    if (file.size > MAX_IMAGE_SIZE) {
+      throw new Error(`Image file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_IMAGE_SIZE / 1024 / 1024}MB`);
     }
 
     const providers = UPLOAD_PROVIDERS;
-
     let lastError = "Upload failed";
+
     for (const provider of providers) {
       try {
-        const data = await proxy({ action: provider.action, file_name, file_type, file_data });
+        // Use FormData for direct file upload
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('action', provider.action);
+        formData.append('apiKey', apiKey);
+
+        const r = await fetch("/api/piapi", {
+          method: "POST",
+          body: formData, // Send as FormData, not JSON
+        });
+
+        const data = await r.json();
         const url = extractUploadUrl(data);
+        
         if (!url) {
           const details = data?.raw ? (typeof data.raw === "string" ? data.raw : JSON.stringify(data.raw)) : "";
           throw new Error(data?.message || data?.error || `No URL from ${provider.id}${details ? `: ${details.slice(0, 180)}` : ""}`);
         }
+        
         log("success", `Job #${jobId + 1}: uploaded via ${provider.id} (${url.slice(0, 90)}${url.length > 90 ? "..." : ""})`);
         return { url, provider: provider.id };
       } catch (err) {
@@ -538,12 +419,8 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     }
     updateJob(job.id, { status: "retrying", retries, error: null });
     await new Promise((r) => setTimeout(r, 1800));
-    let f = job.file;
-    try {
-      if (retries === 2) f = await convertImageFormat(job.file);
-      if (retries === 3) f = await resizeImage(job.file, 0.95);
-    } catch (_) {}
-    await submitSingleJob(job, videoUrl, f, options);
+    // Retry with original file (no compression/conversion)
+    await submitSingleJob(job, videoUrl, job.file, options);
   }
 
   function parseReference(urlInput) {
@@ -758,18 +635,33 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                   if (running) return;
                   const file = e.dataTransfer.files[0];
                   if (!file || !file.type.startsWith('video/')) return;
+                  
+                  // Validate video file size
+                  if (file.size > MAX_VIDEO_SIZE) {
+                    setRefVideoError(`Video file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_VIDEO_SIZE / 1024 / 1024}MB`);
+                    log("error", `Video file too large: ${file.name}`);
+                    return;
+                  }
+
                   try {
                     setRefVideoError("");
                     log("info", `Uploading video file: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
-                    const base64 = await fileToB64(file);
-                    const result = await proxy({
-                      action: "upload_piapi",
-                      file_name: file.name,
-                      file_type: file.type,
-                      file_data: base64,
+                    
+                    // Use FormData for direct file upload
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('action', 'upload_piapi');
+                    formData.append('apiKey', apiKey);
+
+                    const r = await fetch("/api/piapi", {
+                      method: "POST",
+                      body: formData,
                     });
+
+                    const result = await r.json();
                     const url = extractUploadUrl(result);
                     if (!url) throw new Error("Upload failed - no URL returned");
+                    
                     setRefVideoFileName(file.name);
                     setRefVideoName(file.name);
                     refVideoUrlRef.current = url;
@@ -791,23 +683,39 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                   transition: "all 0.2s ease"
                 }}
               >
-                {isVideoDragOver ? "Drop video file here" : "Click to select or drag & drop video file (MP4/MOV)"}
+                {isVideoDragOver ? "Drop video file here" : "Click to select or drag & drop video file (MP4/MOV, max 50MB)"}
               </div>
               <input id="videoFileInput" type="file" accept="video/mp4,video/mov" onChange={async (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
+                
+                // Validate video file size
+                if (file.size > MAX_VIDEO_SIZE) {
+                  setRefVideoError(`Video file too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max: ${MAX_VIDEO_SIZE / 1024 / 1024}MB`);
+                  log("error", `Video file too large: ${file.name}`);
+                  e.target.value = "";
+                  return;
+                }
+
                 try {
                   setRefVideoError("");
                   log("info", `Uploading video file: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
-                  const base64 = await fileToB64(file);
-                  const result = await proxy({
-                    action: "upload_piapi",
-                    file_name: file.name,
-                    file_type: file.type,
-                    file_data: base64,
+                  
+                  // Use FormData for direct file upload
+                  const formData = new FormData();
+                  formData.append('file', file);
+                  formData.append('action', 'upload_piapi');
+                  formData.append('apiKey', apiKey);
+
+                  const r = await fetch("/api/piapi", {
+                    method: "POST",
+                    body: formData,
                   });
+
+                  const result = await r.json();
                   const url = extractUploadUrl(result);
                   if (!url) throw new Error("Upload failed - no URL returned");
+                  
                   setRefVideoFileName(file.name);
                   setRefVideoName(file.name);
                   refVideoUrlRef.current = url;
