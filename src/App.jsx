@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Analytics } from "@vercel/analytics/react";
 
 const POLL_INTERVAL = 8000;
 const MAX_AUTO_RETRIES = 3;
@@ -985,6 +986,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
           )}
         </div>
       </div>
+      <Analytics />
     </div>
   );
 }
