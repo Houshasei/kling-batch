@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Analytics } from "@vercel/analytics/react";
+import JSZip from "jszip";
 
 const POLL_INTERVAL = 8000;
 const MAX_AUTO_RETRIES = 3;
@@ -472,46 +473,48 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     );
   }
 
-  async function submitSingleJob(job, videoUrl, fileOverride, options = {}) {
+  async function submitSingleJob(job, videoUrl, fileOverride) {
     try {
       updateJob(job.id, { status: "uploading", error: null });
       const fileToUpload = fileOverride || job.file;
-      const forceInline = Boolean(options?.forceInline);
 
-      if (forceInline) {
-        const inlinePrepared = await prepareImageInputForKling(fileToUpload, { inline: true });
-        updateJob(job.id, { imageUrl: "base64:inline", uploadProviderUsed: "base64-direct" });
-        const taskId = await submitJob(inlinePrepared.base64, videoUrl);
-        updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
-        log("info", `Job #${job.id + 1}: task ${taskId} submitted (image input: forced base64 retry)`);
-        return true;
-      }
+      // Upload original image without compression
+      const base64 = await fileToB64(fileToUpload);
+      const { url, provider } = await uploadFile({
+        name: fileToUpload.name,
+        type: fileToUpload.type,
+        base64: base64
+      }, job.id);
 
-      // Primary path: URL mode (smaller request payload).
-      const prepared = await prepareImageInputForKling(fileToUpload, { inline: false });
-      let primaryError = null;
+      updateJob(job.id, { imageUrl: url, uploadProviderUsed: provider });
+
+      // Wait 3 seconds for upload to propagate
+      await new Promise(r => setTimeout(r, 3000));
+
+      // Validate URL is accessible
       try {
-        const { url, provider } = await uploadFile(prepared.compressed, job.id);
-        updateJob(job.id, { imageUrl: url, uploadProviderUsed: provider });
-        const taskId = await submitJob(url, videoUrl);
-        updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
-        log("info", `Job #${job.id + 1}: task ${taskId} submitted (image input: url)`);
-        return true;
+        const response = await fetch(url, { method: 'HEAD' });
+        if (!response.ok) {
+          throw new Error(`Upload URL not accessible: ${response.status}`);
+        }
       } catch (err) {
-        primaryError = err;
+        log("warn", `Job #${job.id + 1}: URL validation failed, retrying upload`);
+        // Retry upload once
+        const retryBase64 = await fileToB64(fileToUpload);
+        const { url: retryUrl, provider: retryProvider } = await uploadFile({
+          name: fileToUpload.name,
+          type: fileToUpload.type,
+          base64: retryBase64
+        }, job.id);
+        updateJob(job.id, { imageUrl: retryUrl, uploadProviderUsed: retryProvider });
+
+        // Wait again
+        await new Promise(r => setTimeout(r, 3000));
       }
 
-      // Fallback path: inline base64 only for decode/fetch-style URL issues.
-      if (!isImageDecodeFetchError(primaryError?.message)) {
-        throw primaryError;
-      }
-
-      log("warn", `Job #${job.id + 1}: URL input failed, trying inline base64 fallback`);
-      const inlinePrepared = await prepareImageInputForKling(fileToUpload, { inline: true });
-      updateJob(job.id, { imageUrl: "base64:inline", uploadProviderUsed: "base64-direct" });
-      const taskId = await submitJob(inlinePrepared.base64, videoUrl);
+      const taskId = await submitJob(url, videoUrl);
       updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
-      log("info", `Job #${job.id + 1}: task ${taskId} submitted (image input: base64 fallback)`);
+      log("info", `Job #${job.id + 1}: task ${taskId} submitted`);
       return true;
     } catch (err) {
       updateJob(job.id, { status: "failed", error: err.message });
@@ -927,21 +930,40 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                 ))}
                 <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
                   {completedCount > 0 && completedCount === jobs.length && (
-                    <button onClick={() => {
+                    <button onClick={async () => {
                       const completedJobs = jobs.filter(j => j.status === "completed");
-                      completedJobs.forEach((job, i) => {
-                        setTimeout(() => {
-                          const link = document.createElement('a');
-                          link.href = proxyDownload(job);
-                          link.download = safeDownloadName(job);
-                          document.body.appendChild(link);
-                          link.click();
-                          document.body.removeChild(link);
-                        }, i * 500); // Stagger downloads
-                      });
-                      log("info", `Downloading ${completedJobs.length} completed videos`);
+                      log("info", `Creating ZIP with ${completedJobs.length} videos...`);
+
+                      const zip = new JSZip();
+                      const folder = zip.folder("kling-batch-videos");
+
+                      // Download all videos and add to ZIP
+                      for (let i = 0; i < completedJobs.length; i++) {
+                        const job = completedJobs[i];
+                        try {
+                          const response = await fetch(proxyDownload(job));
+                          const blob = await response.blob();
+                          const fileName = safeDownloadName(job);
+                          folder.file(fileName, blob);
+                          log("info", `Added ${fileName} to ZIP`);
+                        } catch (err) {
+                          log("error", `Failed to add ${job.imageName} to ZIP: ${err.message}`);
+                        }
+                      }
+
+                      // Generate and download ZIP
+                      const zipBlob = await zip.generateAsync({ type: "blob" });
+                      const link = document.createElement('a');
+                      link.href = URL.createObjectURL(zipBlob);
+                      link.download = `kling-batch-${Date.now()}.zip`;
+                      document.body.appendChild(link);
+                      link.click();
+                      document.body.removeChild(link);
+                      URL.revokeObjectURL(link.href);
+
+                      log("success", `ZIP download created with ${completedJobs.length} videos`);
                     }} style={{ padding: "6px 12px", borderRadius: 5, background: c.success, border: "none", color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                      Download All ({completedCount})
+                      Download ZIP ({completedCount})
                     </button>
                   )}
                   <div style={{ fontSize: 11, fontFamily: mono, color: c.accent }}>Spent: ${spent.toFixed(2)}</div>
@@ -974,8 +996,17 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
 
                       {job.videoUrl && (
                         <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
-                          <a href={proxyDownload(job)} download={safeDownloadName(job)} style={{ display: "block", textAlign: "center", padding: "7px 0", borderRadius: 5, background: c.accent + "18", color: c.accent, fontSize: 11, fontWeight: 600, textDecoration: "none", border: `1px solid ${c.accent}30` }}>Download MP4</a>
-                          <a href={job.videoUrl} download={safeDownloadName(job)} target="_blank" rel="noreferrer" style={{ textAlign: "center", fontSize: 9, color: c.hint, textDecoration: "none" }}>Fallback direct link</a>
+                          <div style={{ display: "flex", gap: 4 }}>
+                            <a href={proxyDownload(job)} download={safeDownloadName(job)} style={{ flex: 1, textAlign: "center", padding: "7px 0", borderRadius: 5, background: c.accent + "18", color: c.accent, fontSize: 10, fontWeight: 600, textDecoration: "none", border: `1px solid ${c.accent}30` }}>Download</a>
+                            <button onClick={() => {
+                              updateJob(job.id, { status: "uploading", videoUrl: null, taskId: null, error: null });
+                              const activeVideoUrl = taskVideoUrlRef.current || refVideoUrlRef.current;
+                              submitSingleJob(job, activeVideoUrl);
+                              if (!pollRef.current) startPolling();
+                              log("info", `Regenerating video for ${job.imageName}`);
+                            }} style={{ flex: 1, padding: "7px 0", borderRadius: 5, background: c.warn + "20", border: `1px solid ${c.warn}40`, color: c.warn, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>Regenerate</button>
+                          </div>
+                          <a href={job.videoUrl} download={safeDownloadName(job)} target="_blank" rel="noreferrer" style={{ textAlign: "center", fontSize: 9, color: c.hint, textDecoration: "none" }}>Direct link</a>
                         </div>
                       )}
                     </div>
