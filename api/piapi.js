@@ -1,8 +1,9 @@
 import formidable from 'formidable';
 import fs from 'fs';
-import tls from 'tls';
-import { fetch, FormData, ProxyAgent, Agent } from 'undici';
-import { SocksClient } from 'socks';
+import https from 'https';
+import { fetch, FormData, ProxyAgent } from 'undici';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import NodeFormData from 'form-data';
 
 export const config = {
   api: {
@@ -85,48 +86,20 @@ function classifyProxyFailure(err, status) {
   return { proxyFailed: false, code: code || undefined, detail };
 }
 
-function makeDispatcher(proxyUrl) {
-  if (!proxyUrl) return undefined;
+// Build either an undici Dispatcher (HTTP/HTTPS proxy) or a native https Agent (SOCKS5).
+function prepProxy(proxyUrl) {
+  if (!proxyUrl) return {};
   const u = new URL(proxyUrl);
 
   if (u.protocol === 'http:' || u.protocol === 'https:') {
-    return new ProxyAgent(proxyUrl);
+    return { dispatcher: new ProxyAgent(proxyUrl), kind: 'http' };
   }
 
   if (u.protocol === 'socks5:' || u.protocol === 'socks:' || u.protocol === 'socks5h:') {
-    const proxyHost = u.hostname;
-    const proxyPort = Number(u.port);
-    const userId = u.username ? decodeURIComponent(u.username) : undefined;
-    const password = u.password ? decodeURIComponent(u.password) : undefined;
-
-    return new Agent({
-      connect: (opts, callback) => {
-        (async () => {
-          try {
-            const { socket } = await SocksClient.createConnection({
-              proxy: { host: proxyHost, port: proxyPort, type: 5, userId, password },
-              command: 'connect',
-              destination: { host: opts.hostname, port: Number(opts.port) },
-              timeout: 15000,
-            });
-
-            if (opts.protocol === 'https:') {
-              const tlsSocket = tls.connect({
-                socket,
-                servername: opts.servername || opts.hostname,
-                ALPNProtocols: ['http/1.1'],
-              });
-              tlsSocket.once('secureConnect', () => callback(null, tlsSocket));
-              tlsSocket.once('error', (err) => callback(err));
-            } else {
-              callback(null, socket);
-            }
-          } catch (err) {
-            callback(err);
-          }
-        })();
-      },
-    });
+    return {
+      socksAgent: new SocksProxyAgent(proxyUrl, { timeout: 30000 }),
+      kind: 'socks5',
+    };
   }
 
   const e = new Error(`Unsupported proxy protocol: ${u.protocol}`);
@@ -134,13 +107,84 @@ function makeDispatcher(proxyUrl) {
   throw e;
 }
 
-async function uploadToLitterbox(buffer, filename, mime, { dispatcher } = {}) {
+function closeProxy(proxy) {
+  try { proxy?.dispatcher?.close?.(); } catch (_) {}
+  try { proxy?.socksAgent?.destroy?.(); } catch (_) {}
+}
+
+// Native https.request wrapper that mimics the subset of fetch Response we use.
+function httpsRequestViaSocks(url, { method = 'GET', headers = {}, body, agent, timeoutMs = 60000 } = {}) {
+  const u = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      method,
+      hostname: u.hostname,
+      port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      headers,
+      agent,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        const text = buf.toString('utf8');
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          statusText: res.statusMessage || '',
+          headers: {
+            get: (k) => res.headers[String(k).toLowerCase()],
+          },
+          text: async () => text,
+          _buffer: buf,
+        });
+      });
+      res.on('error', reject);
+    });
+    const timer = setTimeout(() => {
+      req.destroy(Object.assign(new Error('Request timed out'), { code: 'ETIMEDOUT' }));
+    }, timeoutMs);
+    req.on('close', () => clearTimeout(timer));
+    req.on('error', reject);
+    if (body && typeof body.pipe === 'function') {
+      body.pipe(req);
+    } else if (body != null) {
+      req.end(body);
+    } else {
+      req.end();
+    }
+  });
+}
+
+async function uploadToLitterbox(buffer, filename, mime, { dispatcher, socksAgent } = {}) {
+  const endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
+
+  if (socksAgent) {
+    const fd = new NodeFormData();
+    fd.append('reqtype', 'fileupload');
+    fd.append('time', '1h');
+    fd.append('fileToUpload', buffer, { filename, contentType: mime || 'application/octet-stream' });
+    const r = await httpsRequestViaSocks(endpoint, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, Accept: 'text/plain', ...fd.getHeaders() },
+      body: fd,
+      agent: socksAgent,
+    });
+    const text = await r.text();
+    const url = (text || '').trim();
+    if (!r.ok || !/^https?:\/\//i.test(url)) {
+      throw makeUploadError(`Litterbox upload failed (${r.status})`, r.status, text);
+    }
+    return { url, raw: text };
+  }
+
   const fd = new FormData();
   fd.append('reqtype', 'fileupload');
   fd.append('time', '1h');
   fd.append('fileToUpload', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename);
 
-  const r = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+  const r = await fetch(endpoint, {
     method: 'POST',
     headers: { 'User-Agent': UA, Accept: 'text/plain' },
     body: fd,
@@ -155,11 +199,34 @@ async function uploadToLitterbox(buffer, filename, mime, { dispatcher } = {}) {
   return { url, raw: text };
 }
 
-async function uploadToTmpfile(buffer, filename, mime, { dispatcher } = {}) {
+async function uploadToTmpfile(buffer, filename, mime, { dispatcher, socksAgent } = {}) {
+  const endpoint = 'https://tmpfile.link/api/upload';
+
+  if (socksAgent) {
+    const fd = new NodeFormData();
+    fd.append('file', buffer, { filename, contentType: mime || 'application/octet-stream' });
+    const r = await httpsRequestViaSocks(endpoint, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, Accept: 'application/json', ...fd.getHeaders() },
+      body: fd,
+      agent: socksAgent,
+    });
+    const text = await r.text();
+    let json; try { json = JSON.parse(text); } catch (_) { json = null; }
+    if (!r.ok) {
+      throw makeUploadError(`tmpfile upload failed (${r.status})`, r.status, text);
+    }
+    const url = json?.downloadLink || json?.data?.downloadLink;
+    if (!url || !/^https?:\/\//i.test(url)) {
+      throw makeUploadError('tmpfile returned invalid response', r.status, text);
+    }
+    return { url, raw: text };
+  }
+
   const fd = new FormData();
   fd.append('file', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename);
 
-  const r = await fetch('https://tmpfile.link/api/upload', {
+  const r = await fetch(endpoint, {
     method: 'POST',
     headers: { 'User-Agent': UA, Accept: 'application/json' },
     body: fd,
@@ -242,29 +309,30 @@ export default async function handler(req, res) {
 
   try {
     if (action === 'create' || action === 'poll') {
-      let dispatcher;
+      let proxy = {};
       if (proxyUrl) {
         try {
-          dispatcher = makeDispatcher(proxyUrl);
+          proxy = prepProxy(proxyUrl);
         } catch (err) {
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true });
         }
       }
       try {
+        const isCreate = action === 'create';
+        const url = isCreate
+          ? 'https://api.piapi.ai/api/v1/task'
+          : 'https://api.piapi.ai/api/v1/task/' + payload.taskId;
+        const method = isCreate ? 'POST' : 'GET';
+        const headers = isCreate
+          ? { 'x-api-key': apiKey, 'Content-Type': 'application/json' }
+          : { 'x-api-key': apiKey };
+        const body = isCreate ? JSON.stringify(payload.taskBody) : undefined;
+
         let r;
-        if (action === 'create') {
-          r = await fetch('https://api.piapi.ai/api/v1/task', {
-            method: 'POST',
-            headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload.taskBody),
-            dispatcher,
-          });
+        if (proxy.socksAgent) {
+          r = await httpsRequestViaSocks(url, { method, headers, body, agent: proxy.socksAgent });
         } else {
-          r = await fetch('https://api.piapi.ai/api/v1/task/' + payload.taskId, {
-            method: 'GET',
-            headers: { 'x-api-key': apiKey },
-            dispatcher,
-          });
+          r = await fetch(url, { method, headers, body, dispatcher: proxy.dispatcher });
         }
         const text = await r.text();
         let d; try { d = JSON.parse(text); } catch (_) { d = { error: text }; }
@@ -288,7 +356,7 @@ export default async function handler(req, res) {
           code,
         });
       } finally {
-        try { dispatcher?.close?.(); } catch (_) {}
+        closeProxy(proxy);
       }
     }
 
@@ -314,10 +382,10 @@ export default async function handler(req, res) {
       const fileName = file.originalFilename || file.newFilename || 'upload.bin';
       const mime = file.mimetype || 'application/octet-stream';
 
-      let dispatcher;
+      let proxy = {};
       if (proxyUrl) {
         try {
-          dispatcher = makeDispatcher(proxyUrl);
+          proxy = prepProxy(proxyUrl);
         } catch (err) {
           try { await fs.promises.unlink(file.filepath); } catch (_) {}
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true });
@@ -325,7 +393,10 @@ export default async function handler(req, res) {
       }
 
       try {
-        const { url, raw } = await hostDef.upload(buffer, fileName, mime, { dispatcher });
+        const { url, raw } = await hostDef.upload(buffer, fileName, mime, {
+          dispatcher: proxy.dispatcher,
+          socksAgent: proxy.socksAgent,
+        });
         return res.status(200).json({
           data: {
             fileName,
@@ -350,7 +421,7 @@ export default async function handler(req, res) {
           code,
         });
       } finally {
-        try { dispatcher?.close?.(); } catch (_) {}
+        closeProxy(proxy);
         try { await fs.promises.unlink(file.filepath); } catch (_) {}
       }
     }

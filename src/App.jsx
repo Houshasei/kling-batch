@@ -11,9 +11,10 @@ const MAX_AUTO_RETRIES = 5;
 const UPLOAD_PROPAGATION_MS = 2000;
 const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
-const RETRY_TARGET_BYTES = 1 * 1024 * 1024; // 1 MB
-const MIN_SHORT_EDGE_PX = 512;
 const VERCEL_HOBBY_LIMIT = 4 * 1024 * 1024;
+const MAX_LONG_EDGE_PX = 1536;
+const NORMALIZE_JPG_QUALITY = 0.92;
+const RETRY_JPG_QUALITIES = [0.88, 0.85, 0.82, 0.79, 0.76];
 const LOG_BUFFER = 300;
 const STORAGE_API_KEY = "kling_batch_api_key";
 const STORAGE_UPLOAD_HOST = "kling_batch_upload_host";
@@ -163,7 +164,7 @@ function createProxyPool(proxies) {
 }
 
 // =======================================================================
-// Invisible image mutation for retries
+// Ratio-preserving image normalization + retry re-encoding (9:16 safe)
 // =======================================================================
 
 function loadImage(file) {
@@ -171,7 +172,7 @@ function loadImage(file) {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => { resolve(img); URL.revokeObjectURL(url); };
-    img.onerror = (e) => { URL.revokeObjectURL(url); reject(new Error("Image load failed")); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Image load failed")); };
     img.src = url;
   });
 }
@@ -182,96 +183,87 @@ function canvasToBlob(canvas, mime, quality) {
   });
 }
 
-/**
- * Deterministic invisible mutation for retries.
- * @param {File} file - original source file (kept clean on the job)
- * @param {number} attempt - 1-indexed retry attempt
- * @param {"jpg"|"png"} format - output format (alternates per retry upstream)
- * @returns {Promise<{file: File, detail: string}>}
- */
-async function mutateImageForRetry(file, attempt, format) {
-  const img = await loadImage(file);
-  const edges = ["top", "right", "bottom", "left"];
-  const edge = edges[attempt % 4];
-  const cropPx = 1 + (attempt % 2); // 1 or 2 px
-  const rotateDeg = (attempt * 0.11) - 0.22; // small, alternating
-
-  const cropL = edge === "left" ? cropPx : 0;
-  const cropR = edge === "right" ? cropPx : 0;
-  const cropT = edge === "top" ? cropPx : 0;
-  const cropB = edge === "bottom" ? cropPx : 0;
-
-  let targetW = Math.max(1, img.naturalWidth - cropL - cropR);
-  let targetH = Math.max(1, img.naturalHeight - cropT - cropB);
-
-  async function render(w, h) {
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, w, h);
-    ctx.translate(w / 2, h / 2);
-    ctx.rotate((rotateDeg * Math.PI) / 180);
-    // Draw source, offsetting for the applied crop
-    ctx.drawImage(
-      img,
-      cropL, cropT,
-      img.naturalWidth - cropL - cropR, img.naturalHeight - cropT - cropB,
-      -w / 2, -h / 2,
-      w, h
-    );
-    return canvas;
-  }
-
-  let blob;
-  let qUsed = null;
-
-  if (format === "jpg") {
-    // Quality ladder + downscale
-    let canvas = await render(targetW, targetH);
-    let q = 0.6; qUsed = q;
-    blob = await canvasToBlob(canvas, "image/jpeg", q);
-    if (blob.size > RETRY_TARGET_BYTES) {
-      q = 0.5; qUsed = q;
-      blob = await canvasToBlob(canvas, "image/jpeg", q);
-    }
-    while (blob.size > RETRY_TARGET_BYTES) {
-      const shortEdge = Math.min(targetW, targetH);
-      if (shortEdge <= MIN_SHORT_EDGE_PX) break;
-      targetW = Math.max(MIN_SHORT_EDGE_PX, Math.round(targetW * 0.85));
-      targetH = Math.max(MIN_SHORT_EDGE_PX, Math.round(targetH * 0.85));
-      canvas = await render(targetW, targetH);
-      q = 0.55; qUsed = q;
-      blob = await canvasToBlob(canvas, "image/jpeg", q);
-    }
-  } else {
-    // PNG: lossless; downscale only
-    let canvas = await render(targetW, targetH);
-    blob = await canvasToBlob(canvas, "image/png");
-    while (blob.size > RETRY_TARGET_BYTES) {
-      const shortEdge = Math.min(targetW, targetH);
-      if (shortEdge <= MIN_SHORT_EDGE_PX) break;
-      targetW = Math.max(MIN_SHORT_EDGE_PX, Math.round(targetW * 0.85));
-      targetH = Math.max(MIN_SHORT_EDGE_PX, Math.round(targetH * 0.85));
-      canvas = await render(targetW, targetH);
-      blob = await canvasToBlob(canvas, "image/png");
-    }
-  }
-
-  const ext = format === "jpg" ? "jpg" : "png";
-  const mime = format === "jpg" ? "image/jpeg" : "image/png";
-  const outName = `${safeBase(file.name)}-r${attempt}-${rand4()}.${ext}`;
-  const newFile = new File([blob], outName, { type: mime, lastModified: Date.now() });
-
-  const detail = `${format}${qUsed ? ` q=${qUsed}` : ""}, crop=${edge} ${cropPx}px, rot=${rotateDeg.toFixed(2)}°, ${targetW}x${targetH}, ${formatBytes(file.size)} → ${formatBytes(newFile.size)}`;
-  return { file: newFile, detail };
+function drawOpaque(img, w, h) {
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(img, 0, 0, w, h);
+  return { canvas, ctx };
 }
 
-function pickNextFormat(lastFormat) {
-  if (lastFormat === "jpg") return "png";
-  if (lastFormat === "png") return "jpg";
-  return Math.random() < 0.5 ? "jpg" : "png";
+/**
+ * Attempt-0 pre-flight. Ratio-preserving; no cropping ever.
+ * Runs only if source is PNG, exceeds MAX_LONG_EDGE_PX, or has a non-image/jpeg type.
+ * Returns { file, changed, detail }.
+ */
+async function normalizeForKling(file) {
+  const type = String(file.type || "").toLowerCase();
+  const isJpg = type === "image/jpeg" || type === "image/jpg";
+  const img = await loadImage(file);
+  const srcW = img.naturalWidth;
+  const srcH = img.naturalHeight;
+  const longEdge = Math.max(srcW, srcH);
+
+  const needsDownscale = longEdge > MAX_LONG_EDGE_PX;
+  const needsReencode = !isJpg; // PNG/WebP/etc. → JPG to strip alpha/EXIF and match Kling's expected format
+
+  if (!needsDownscale && !needsReencode) {
+    return { file, changed: false, detail: `passthrough ${srcW}x${srcH} jpg` };
+  }
+
+  let outW = srcW;
+  let outH = srcH;
+  if (needsDownscale) {
+    const scale = MAX_LONG_EDGE_PX / longEdge;
+    outW = Math.round(srcW * scale);
+    outH = Math.round(srcH * scale);
+  }
+
+  const { canvas } = drawOpaque(img, outW, outH);
+  const blob = await canvasToBlob(canvas, "image/jpeg", NORMALIZE_JPG_QUALITY);
+  const outName = `${safeBase(file.name)}-norm.jpg`;
+  const newFile = new File([blob], outName, { type: "image/jpeg", lastModified: Date.now() });
+  const detail = `${type || "unknown"} ${srcW}x${srcH} → jpg ${outW}x${outH} (${formatBytes(file.size)} → ${formatBytes(newFile.size)})`;
+  return { file: newFile, changed: true, detail };
+}
+
+/**
+ * Retry re-encoding that preserves pixel dimensions bit-exactly.
+ * Varies JPG quality per attempt and flips one imperceptible pixel to defeat
+ * any content-hash / perceptual-hash dedupe on the Kling side.
+ * @param {File} file - the image that was already uploaded (post-normalization on attempt 0)
+ * @param {number} attempt - 1-indexed retry attempt
+ * @returns {Promise<{file: File, detail: string}>}
+ */
+async function reencodeForRetry(file, attempt) {
+  const img = await loadImage(file);
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
+
+  const { canvas, ctx } = drawOpaque(img, w, h);
+
+  // Flip one pixel imperceptibly. Position varies per attempt so retries never collide.
+  const corners = [
+    [0, 0],
+    [w - 1, 0],
+    [0, h - 1],
+    [w - 1, h - 1],
+    [Math.floor(w / 2), Math.floor(h / 2)],
+  ];
+  const [px, py] = corners[(attempt - 1) % corners.length];
+  const pixel = ctx.getImageData(px, py, 1, 1);
+  pixel.data[0] = (pixel.data[0] + 1) % 256; // ±1 in R channel
+  ctx.putImageData(pixel, px, py);
+
+  const q = RETRY_JPG_QUALITIES[(attempt - 1) % RETRY_JPG_QUALITIES.length];
+  const blob = await canvasToBlob(canvas, "image/jpeg", q);
+  const outName = `${safeBase(file.name)}-r${attempt}-${rand4()}.jpg`;
+  const newFile = new File([blob], outName, { type: "image/jpeg", lastModified: Date.now() });
+  const detail = `jpg q=${q}, dims preserved ${w}x${h}, pixel=${px},${py}, ${formatBytes(file.size)} → ${formatBytes(newFile.size)}`;
+  return { file: newFile, detail };
 }
 
 // =======================================================================
@@ -723,7 +715,12 @@ export default function App() {
     );
   }
 
-  async function submitSingleJob(job, videoUrl, { forceReupload = false, attempt = 0 } = {}) {
+  function isFreezePointError(msg) {
+    const s = String(msg || "").toLowerCase();
+    return s.includes("freeze point") || s.includes("freezepoint");
+  }
+
+  async function submitSingleJob(job, videoUrl, { forceReupload = false, attempt = 0, reason = null } = {}) {
     try {
       updateJob(job.id, { status: "uploading", error: null });
       if (!job.file || !(job.file instanceof File)) throw new Error("Invalid file");
@@ -732,16 +729,21 @@ export default function App() {
       const hostForJob = job.hostSnapshot || uploadHost;
 
       if (!imageUrl || forceReupload) {
-        let fileToSend = job.file;
-        let lastFmt = job.lastRetryFormat || null;
+        // Baseline = ratio-preserving normalized file on attempt 0; cache on the job so retries reuse it.
+        let baseline = job.normalizedFile instanceof File ? job.normalizedFile : null;
+        if (!baseline) {
+          const { file: normFile, changed, detail } = await normalizeForKling(job.file);
+          baseline = normFile;
+          if (changed) log("info", `[Job ${job.id + 1}] Normalized: ${detail}`);
+          updateJob(job.id, { normalizedFile: baseline });
+        }
 
+        let fileToSend = baseline;
         if (attempt > 0) {
-          const nextFmt = pickNextFormat(lastFmt);
-          const { file: mutated, detail } = await mutateImageForRetry(job.file, attempt, nextFmt);
-          log("info", `[Job ${job.id + 1}] Mutated for retry ${attempt} (${detail})`);
-          fileToSend = mutated;
-          lastFmt = nextFmt;
-          updateJob(job.id, { lastRetryFormat: nextFmt });
+          const { file: reencoded, detail } = await reencodeForRetry(baseline, attempt);
+          const tag = reason === "freeze_point" ? "freeze-point retry" : `retry ${attempt}`;
+          log("info", `[Job ${job.id + 1}] Re-encoded for ${tag}: ${detail}`);
+          fileToSend = reencoded;
         }
 
         const currentJob = jobsRef.current.find((j) => j.id === job.id) || job;
@@ -763,7 +765,7 @@ export default function App() {
     }
   }
 
-  async function autoRetry(job, videoUrl, { forceReupload = false } = {}) {
+  async function autoRetry(job, videoUrl, { forceReupload = false, reason = null } = {}) {
     const retries = (job.retries || 0) + 1;
     if (retries > MAX_AUTO_RETRIES) {
       updateJob(job.id, { status: "failed", retries });
@@ -773,7 +775,7 @@ export default function App() {
     await new Promise((r) => setTimeout(r, 1800));
     if (forceReupload) updateJob(job.id, { imageUrl: null });
     const fresh = jobsRef.current.find((j) => j.id === job.id) || job;
-    await submitSingleJob(fresh, videoUrl, { forceReupload, attempt: retries });
+    await submitSingleJob(fresh, videoUrl, { forceReupload, attempt: retries, reason });
   }
 
   // =====================================================================
@@ -850,7 +852,7 @@ export default function App() {
       imageUrl: null,
       uploadProviderUsed: null,
       hostSnapshot: uploadHost,
-      lastRetryFormat: null,
+      normalizedFile: null,
       jobProxyId: null,
       jobProxyUrl: null,
       firstPollLogged: false,
@@ -884,7 +886,7 @@ export default function App() {
       return;
     }
     const preview = await fileToPreview(newFile);
-    updateJob(id, { file: newFile, imageName: newFile.name, preview, status: "uploading", imageUrl: null, retries: 0, lastRetryFormat: null, jobProxyId: null, jobProxyUrl: null, firstPollLogged: false, error: null });
+    updateJob(id, { file: newFile, imageName: newFile.name, preview, status: "uploading", imageUrl: null, retries: 0, normalizedFile: null, jobProxyId: null, jobProxyUrl: null, firstPollLogged: false, error: null });
     const job = jobsRef.current.find((j) => j.id === id);
     if (!job) return;
     if (batchDone) { setBatchDone(false); setRunning(true); }
@@ -926,11 +928,13 @@ export default function App() {
             const vurl = refVideoUrlRef.current;
 
             if (isImageDecodeFetchError(errMsg) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
-              log("warn", `[Job ${job.id + 1}] Decode/fetch — re-uploading (attempt ${next}/${MAX_AUTO_RETRIES})`);
-              await autoRetry(current, vurl, { forceReupload: true });
+              const reason = isFreezePointError(errMsg) ? "freeze_point" : "decode_fetch";
+              const label = reason === "freeze_point" ? "Freeze-point" : "Decode/fetch";
+              log("warn", `[Job ${job.id + 1}] ${label} — re-uploading (attempt ${next}/${MAX_AUTO_RETRIES})`);
+              await autoRetry(current, vurl, { forceReupload: true, reason });
             } else if (isContentFilterError(errMsg) && (current?.retries || 0) < MAX_AUTO_RETRIES) {
               log("warn", `[Job ${job.id + 1}] Content filter — retrying (attempt ${next}/${MAX_AUTO_RETRIES})`);
-              await autoRetry(current, vurl, { forceReupload: true });
+              await autoRetry(current, vurl, { forceReupload: true, reason: "content_filter" });
             } else {
               updateJob(job.id, { status: "failed" });
             }
