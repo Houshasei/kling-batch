@@ -19,7 +19,9 @@ const STORAGE_API_KEY = "kling_batch_api_key";
 const STORAGE_UPLOAD_HOST = "kling_batch_upload_host";
 const STORAGE_USE_PROXY = "kling_batch_use_proxy";
 const STORAGE_WEBSHARE_KEY = "kling_batch_webshare_key";
+const STORAGE_PROXY_PROTOCOL = "kling_batch_proxy_protocol";
 const MAX_PROXY_REROLLS = 5;
+const PROXY_PROTOCOLS = ["http", "socks5"];
 
 const font = `'DM Sans', sans-serif`;
 const mono = `'JetBrains Mono', 'Fira Code', monospace`;
@@ -339,6 +341,10 @@ export default function App() {
   const [useProxy, setUseProxy] = useState(() => localStorage.getItem(STORAGE_USE_PROXY) === "true");
   const [webshareKey, setWebshareKey] = useState(() => localStorage.getItem(STORAGE_WEBSHARE_KEY) || "");
   const [webshareInput, setWebshareInput] = useState("");
+  const [proxyProtocol, setProxyProtocol] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_PROXY_PROTOCOL);
+    return PROXY_PROTOCOLS.includes(saved) ? saved : "socks5";
+  });
   const [proxyCount, setProxyCount] = useState(0);
   const [proxyLoading, setProxyLoading] = useState(false);
   const [proxyError, setProxyError] = useState("");
@@ -391,6 +397,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem(STORAGE_UPLOAD_HOST, uploadHost); }, [uploadHost]);
   useEffect(() => { localStorage.setItem(STORAGE_USE_PROXY, useProxy ? "true" : "false"); }, [useProxy]);
   useEffect(() => { localStorage.setItem(STORAGE_WEBSHARE_KEY, webshareKey || ""); }, [webshareKey]);
+  useEffect(() => { localStorage.setItem(STORAGE_PROXY_PROTOCOL, proxyProtocol); }, [proxyProtocol]);
 
   // Global drop guard
   useEffect(() => {
@@ -488,18 +495,19 @@ export default function App() {
     return { url, finalHost: json?.data?.uploadedTo || host };
   }
 
-  async function loadProxies(key, { silent = false } = {}) {
+  async function loadProxies(key, { silent = false, protocol } = {}) {
     const k = key || webshareKey;
     if (!k) return null;
+    const proto = protocol || proxyProtocol;
     setProxyLoading(true);
     setProxyError("");
     try {
-      const d = await proxyJson({ action: "list_proxies", webshareKey: k });
+      const d = await proxyJson({ action: "list_proxies", webshareKey: k, protocol: proto });
       const list = Array.isArray(d?.proxies) ? d.proxies : [];
       if (list.length === 0) throw new Error("Webshare returned 0 proxies");
       proxyPoolRef.current = createProxyPool(list);
       setProxyCount(list.length);
-      if (!silent) log("success", `Webshare: loaded ${list.length} proxies`);
+      if (!silent) log("success", `Webshare: loaded ${list.length} proxies (${proto.toUpperCase()})`);
       return list.length;
     } catch (err) {
       setProxyError(err.message);
@@ -605,6 +613,16 @@ export default function App() {
     proxyPoolRef.current = null;
   }
 
+  async function handleChangeProtocol(next) {
+    if (!PROXY_PROTOCOLS.includes(next) || next === proxyProtocol) return;
+    setProxyProtocol(next);
+    proxyPoolRef.current = null;
+    setProxyCount(0);
+    if (useProxy && webshareKey) {
+      await loadProxies(webshareKey, { silent: false, protocol: next });
+    }
+  }
+
   // =====================================================================
   // Kling task lifecycle
   // =====================================================================
@@ -695,7 +713,14 @@ export default function App() {
 
   function isImageDecodeFetchError(msg) {
     const s = String(msg || "").toLowerCase();
-    return s.includes("failed to decode input image") || s.includes("decode input image") || s.includes("invalid image") || s.includes("fetch");
+    return (
+      s.includes("failed to decode input image") ||
+      s.includes("decode input image") ||
+      s.includes("invalid image") ||
+      s.includes("fetch") ||
+      s.includes("freeze point") ||
+      s.includes("freezepoint")
+    );
   }
 
   async function submitSingleJob(job, videoUrl, { forceReupload = false, attempt = 0 } = {}) {
@@ -1171,9 +1196,24 @@ export default function App() {
             )}
 
             {useProxy && webshareKey && (
-              <div style={{ display: "grid", gap: 4 }}>
+              <div style={{ display: "grid", gap: 6 }}>
                 <div style={{ fontSize: 10, color: c.success, fontFamily: mono }}>
                   ✓ Webshare connected — {proxyCount || "…"} proxies
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 9, color: c.muted, fontFamily: mono }}>Protocol</span>
+                  <select
+                    value={proxyProtocol}
+                    onChange={(e) => handleChangeProtocol(e.target.value)}
+                    disabled={running || proxyLoading}
+                    style={{ flex: 1, background: c.surface, border: `1px solid ${c.border}`, borderRadius: 4, padding: "3px 6px", color: c.text, fontFamily: mono, fontSize: 10, outline: "none" }}
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                  </select>
+                </div>
+                <div style={{ fontSize: 9, color: c.hint, lineHeight: 1.4 }}>
+                  SOCKS5 requires a Webshare plan with SOCKS5 enabled.
                 </div>
                 {proxyPoolRef.current && (
                   <div style={{ fontSize: 9, color: c.hint, fontFamily: mono }}>

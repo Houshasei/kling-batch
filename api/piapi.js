@@ -1,6 +1,8 @@
 import formidable from 'formidable';
 import fs from 'fs';
-import { fetch, FormData, ProxyAgent } from 'undici';
+import tls from 'tls';
+import { fetch, FormData, ProxyAgent, Agent } from 'undici';
+import { SocksClient } from 'socks';
 
 export const config = {
   api: {
@@ -65,14 +67,70 @@ function makeUploadError(message, status, body) {
 const PROXY_FAIL_CODES = new Set([
   'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNREFUSED', 'EPROTO',
   'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'ERR_SOCKS_INVALID_SOCKS_VERSION', 'ERR_SOCKS_AUTHENTICATION_FAILED',
+  'ERR_SOCKS_CONNECTION_TIMEOUT', 'ERR_SOCKS_CONNECTION_REFUSED',
+  'ERR_SOCKS_PROXY_CLOSED_SOCKET', 'ERR_SOCKS_PROTOCOL',
 ]);
 const PROXY_FAIL_STATUSES = new Set([407, 429, 502, 503, 504]);
 
 function classifyProxyFailure(err, status) {
   const code = err?.cause?.code || err?.code || '';
+  const msg = err?.cause?.message || err?.message || '';
   if (PROXY_FAIL_CODES.has(code)) return { proxyFailed: true, code };
   if (PROXY_FAIL_STATUSES.has(status)) return { proxyFailed: true, code: code || undefined };
+  if (/^SOCKS\b/i.test(msg) || /socks/i.test(err?.name || '')) {
+    return { proxyFailed: true, code: code || 'SOCKS_ERROR' };
+  }
   return { proxyFailed: false, code: code || undefined };
+}
+
+function makeDispatcher(proxyUrl) {
+  if (!proxyUrl) return undefined;
+  const u = new URL(proxyUrl);
+
+  if (u.protocol === 'http:' || u.protocol === 'https:') {
+    return new ProxyAgent(proxyUrl);
+  }
+
+  if (u.protocol === 'socks5:' || u.protocol === 'socks:' || u.protocol === 'socks5h:') {
+    const proxyHost = u.hostname;
+    const proxyPort = Number(u.port);
+    const userId = u.username ? decodeURIComponent(u.username) : undefined;
+    const password = u.password ? decodeURIComponent(u.password) : undefined;
+
+    return new Agent({
+      connect: (opts, callback) => {
+        (async () => {
+          try {
+            const { socket } = await SocksClient.createConnection({
+              proxy: { host: proxyHost, port: proxyPort, type: 5, userId, password },
+              command: 'connect',
+              destination: { host: opts.hostname, port: Number(opts.port) },
+              timeout: 15000,
+            });
+
+            if (opts.protocol === 'https:') {
+              const tlsSocket = tls.connect({
+                socket,
+                servername: opts.servername || opts.hostname,
+                ALPNProtocols: ['http/1.1'],
+              });
+              tlsSocket.once('secureConnect', () => callback(null, tlsSocket));
+              tlsSocket.once('error', (err) => callback(err));
+            } else {
+              callback(null, socket);
+            }
+          } catch (err) {
+            callback(err);
+          }
+        })();
+      },
+    });
+  }
+
+  const e = new Error(`Unsupported proxy protocol: ${u.protocol}`);
+  e.code = 'ERR_PROXY_UNSUPPORTED';
+  throw e;
 }
 
 async function uploadToLitterbox(buffer, filename, mime, { dispatcher } = {}) {
@@ -163,16 +221,17 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: `Request parse failed: ${err.message}` });
   }
 
-  let action, apiKey, payload, host, proxyUrl, webshareKey;
+  let action, apiKey, payload, host, proxyUrl, webshareKey, protocol;
 
   if (parsed.isFormData) {
     action = fieldValue(parsed.fields, 'action');
     apiKey = fieldValue(parsed.fields, 'apiKey');
     host = fieldValue(parsed.fields, 'host');
     proxyUrl = fieldValue(parsed.fields, 'proxyUrl');
+    protocol = fieldValue(parsed.fields, 'protocol');
     payload = { fields: parsed.fields, files: parsed.files };
   } else {
-    ({ action, apiKey, host, proxyUrl, webshareKey, ...payload } = parsed.body || {});
+    ({ action, apiKey, host, proxyUrl, webshareKey, protocol, ...payload } = parsed.body || {});
   }
 
   const needsApiKey = ['create', 'poll'].includes(action);
@@ -183,9 +242,9 @@ export default async function handler(req, res) {
   try {
     if (action === 'create' || action === 'poll') {
       let dispatcher;
-      if (proxyUrl && /^https?:\/\//i.test(proxyUrl)) {
+      if (proxyUrl) {
         try {
-          dispatcher = new ProxyAgent(proxyUrl);
+          dispatcher = makeDispatcher(proxyUrl);
         } catch (err) {
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true });
         }
@@ -255,9 +314,9 @@ export default async function handler(req, res) {
       const mime = file.mimetype || 'application/octet-stream';
 
       let dispatcher;
-      if (proxyUrl && /^https?:\/\//i.test(proxyUrl)) {
+      if (proxyUrl) {
         try {
-          dispatcher = new ProxyAgent(proxyUrl);
+          dispatcher = makeDispatcher(proxyUrl);
         } catch (err) {
           try { await fs.promises.unlink(file.filepath); } catch (_) {}
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true });
@@ -312,8 +371,9 @@ export default async function handler(req, res) {
           return res.status(r.status).json({ error: json?.detail || json?.error || `Webshare HTTP ${r.status}`, body: text.slice(0, 500) });
         }
         const results = Array.isArray(json?.results) ? json.results : [];
+        const scheme = protocol === 'socks5' ? 'socks5' : 'http';
         for (const p of results) {
-          const u = `http://${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@${p.proxy_address}:${p.port}`;
+          const u = `${scheme}://${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@${p.proxy_address}:${p.port}`;
           proxies.push({ id: String(p.id ?? `${p.proxy_address}:${p.port}`), url: u, country: p.country_code || null });
         }
         if (!json?.next) break;
