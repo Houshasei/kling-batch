@@ -151,6 +151,7 @@ export default function App() {
   const [batchDone, setBatchDone] = useState(false);
   const [logs, setLogs] = useState([]);
   const [serviceStatus, setServiceStatus] = useState({ checking: false, data: null, lastChecked: null });
+  const [isDownloadingZip, setIsDownloadingZip] = useState(false);
 
   const imgRef = useRef();
   const replaceImgRefs = useRef({});
@@ -159,6 +160,7 @@ export default function App() {
   const refVideoUrlRef = useRef("");
   const taskVideoUrlRef = useRef("");
   const probingRef = useRef(false);
+  const logsEndRef = useRef(null);
 
   const rate = mode === "std" ? 0.065 : 0.104;
   const perVideo = rate * videoDuration;
@@ -167,6 +169,11 @@ export default function App() {
   const log = useCallback((type, message) => {
     setLogs((prev) => [...prev.slice(-199), { id: Date.now() + Math.random(), ts: new Date().toLocaleTimeString(), type, message }]);
   }, []);
+
+  // Auto-scroll logs to bottom
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_API_KEY, apiKey || "");
@@ -381,26 +388,43 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       const { url, provider } = await uploadFile(fileToUpload, job.id);
       updateJob(job.id, { imageUrl: url, uploadProviderUsed: provider });
 
-      // Wait 3 seconds for upload to propagate
-      await new Promise(r => setTimeout(r, 3000));
+      // Wait longer for upload to propagate (5 seconds)
+      await new Promise(r => setTimeout(r, 5000));
 
-      // Validate URL is accessible
-      try {
-        const response = await fetch(url, { method: 'HEAD' });
-        if (!response.ok) {
-          throw new Error(`Upload URL not accessible: ${response.status}`);
+      // Validate URL is accessible with retries
+      let finalUrl = url;
+      let urlAccessible = false;
+      
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const response = await fetch(finalUrl, { method: 'HEAD' });
+          if (response.ok) {
+            urlAccessible = true;
+            break;
+          }
+          log("warn", `Job #${job.id + 1}: URL validation attempt ${attempt}/3 failed (${response.status})`);
+        } catch (err) {
+          log("warn", `Job #${job.id + 1}: URL validation attempt ${attempt}/3 failed (${err.message})`);
         }
-      } catch (err) {
-        log("warn", `Job #${job.id + 1}: URL validation failed, retrying upload`);
-        // Retry upload once
-        const { url: retryUrl, provider: retryProvider } = await uploadFile(fileToUpload, job.id);
-        updateJob(job.id, { imageUrl: retryUrl, uploadProviderUsed: retryProvider });
-
-        // Wait again
-        await new Promise(r => setTimeout(r, 3000));
+        
+        // Wait before retry
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 2000));
+        }
       }
 
-      const taskId = await submitJob(url, videoUrl);
+      // If URL still not accessible, try re-uploading
+      if (!urlAccessible) {
+        log("warn", `Job #${job.id + 1}: URL not accessible after 3 attempts, re-uploading`);
+        const { url: retryUrl, provider: retryProvider } = await uploadFile(fileToUpload, job.id);
+        finalUrl = retryUrl;
+        updateJob(job.id, { imageUrl: retryUrl, uploadProviderUsed: retryProvider });
+        
+        // Wait for new upload to propagate
+        await new Promise(r => setTimeout(r, 5000));
+      }
+
+      const taskId = await submitJob(finalUrl, videoUrl);
       updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
       log("info", `Job #${job.id + 1}: task ${taskId} submitted`);
       return true;
@@ -467,7 +491,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
       imageName: img.name,
       file: img.file,
       preview: img.preview,
-      status: "uploading",
+      status: "pending",
       taskId: null,
       videoUrl: null,
       imageUrl: null,
@@ -481,7 +505,18 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
     setBatchDone(false);
 
     const vurl = taskVideoUrl;
-    await Promise.all(initial.map((job) => submitSingleJob(job, vurl)));
+    
+    // Process jobs sequentially with small delay to avoid overwhelming the upload service
+    for (let i = 0; i < initial.length; i++) {
+      const job = initial[i];
+      await submitSingleJob(job, vurl);
+      
+      // Add small delay between jobs (except for the last one)
+      if (i < initial.length - 1) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    
     startPolling();
   }
 
@@ -742,6 +777,7 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
               {logs.length === 0 ? <div style={{ fontSize: 10, color: c.hint }}>No logs yet.</div> : logs.map((l) => (
                 <div key={l.id} style={{ fontSize: 10, fontFamily: mono, color: l.type === "error" ? c.error : l.type === "warn" ? c.warn : l.type === "success" ? c.success : c.muted }}>[{l.ts}] {l.message}</div>
               ))}
+              <div ref={logsEndRef} />
             </div>
           </div>
 
@@ -844,41 +880,73 @@ async function prepareVideoUrlForTask(rawVideoUrl) {
                   <div key={label} style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 5, height: 5, borderRadius: "50%", background: col }} /><span style={{ fontSize: 10, fontFamily: mono, color: col, textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</span><span style={{ fontSize: 12, fontFamily: mono, fontWeight: 600 }}>{count}</span></div>
                 ))}
                 <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
-                  {completedCount > 0 && completedCount === jobs.length && (
-                    <button onClick={async () => {
-                      const completedJobs = jobs.filter(j => j.status === "completed");
-                      log("info", `Creating ZIP with ${completedJobs.length} videos...`);
+                  {completedCount > 0 && (
+                    <button 
+                      onClick={async () => {
+                        if (isDownloadingZip) return;
+                        
+                        setIsDownloadingZip(true);
+                        const completedJobs = jobs.filter(j => j.status === "completed");
+                        log("info", `Creating ZIP with ${completedJobs.length} videos...`);
 
-                      const zip = new JSZip();
-                      const folder = zip.folder("kling-batch-videos");
+                        const zip = new JSZip();
+                        const folder = zip.folder("kling-batch-videos");
 
-                      // Download all videos and add to ZIP
-                      for (let i = 0; i < completedJobs.length; i++) {
-                        const job = completedJobs[i];
-                        try {
-                          const response = await fetch(proxyDownload(job));
-                          const blob = await response.blob();
-                          const fileName = safeDownloadName(job);
-                          folder.file(fileName, blob);
-                          log("info", `Added ${fileName} to ZIP`);
-                        } catch (err) {
-                          log("error", `Failed to add ${job.imageName} to ZIP: ${err.message}`);
+                        // Download all videos and add to ZIP
+                        for (let i = 0; i < completedJobs.length; i++) {
+                          const job = completedJobs[i];
+                          try {
+                            log("info", `Downloading ${i + 1}/${completedJobs.length}: ${job.imageName}`);
+                            const response = await fetch(proxyDownload(job));
+                            const blob = await response.blob();
+                            const fileName = safeDownloadName(job);
+                            folder.file(fileName, blob);
+                            log("success", `Added ${fileName} to ZIP (${i + 1}/${completedJobs.length})`);
+                          } catch (err) {
+                            log("error", `Failed to add ${job.imageName} to ZIP: ${err.message}`);
+                          }
                         }
-                      }
 
-                      // Generate and download ZIP
-                      const zipBlob = await zip.generateAsync({ type: "blob" });
-                      const link = document.createElement('a');
-                      link.href = URL.createObjectURL(zipBlob);
-                      link.download = `kling-batch-${Date.now()}.zip`;
-                      document.body.appendChild(link);
-                      link.click();
-                      document.body.removeChild(link);
-                      URL.revokeObjectURL(link.href);
+                        // Generate and download ZIP
+                        log("info", "Generating ZIP file...");
+                        const zipBlob = await zip.generateAsync({ type: "blob" });
+                        const link = document.createElement('a');
+                        link.href = URL.createObjectURL(zipBlob);
+                        link.download = `kling-batch-${Date.now()}.zip`;
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        URL.revokeObjectURL(link.href);
 
-                      log("success", `ZIP download created with ${completedJobs.length} videos`);
-                    }} style={{ padding: "6px 12px", borderRadius: 5, background: c.success, border: "none", color: "#fff", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                      Download ZIP ({completedCount})
+                        log("success", `ZIP download created with ${completedJobs.length} videos`);
+                        setIsDownloadingZip(false);
+                      }} 
+                      disabled={isDownloadingZip}
+                      style={{ 
+                        padding: "6px 12px", 
+                        borderRadius: 5, 
+                        background: isDownloadingZip ? c.tag : c.success, 
+                        border: "none", 
+                        color: "#fff", 
+                        fontSize: 11, 
+                        fontWeight: 600, 
+                        cursor: isDownloadingZip ? "default" : "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6
+                      }}
+                    >
+                      {isDownloadingZip && (
+                        <span style={{ 
+                          width: 10, 
+                          height: 10, 
+                          border: "2px solid #fff", 
+                          borderTopColor: "transparent", 
+                          borderRadius: "50%", 
+                          animation: "spin 0.6s linear infinite" 
+                        }} />
+                      )}
+                      {isDownloadingZip ? "Creating ZIP..." : `Download ZIP (${completedCount})`}
                     </button>
                   )}
                   <div style={{ fontSize: 11, fontFamily: mono, color: c.accent }}>Spent: ${spent.toFixed(2)}</div>
