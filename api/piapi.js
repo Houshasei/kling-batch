@@ -1,6 +1,6 @@
 import formidable from 'formidable';
 import fs from 'fs';
-import { ProxyAgent } from 'undici';
+import { fetch, ProxyAgent } from 'undici';
 
 export const config = {
   api: {
