@@ -1041,20 +1041,15 @@ export default function App() {
   const safeDownloadName = (job) => `${safeBase(job.imageName)}.mp4`;
   const proxyDownload = (job) => `${API_BASE}?action=download_proxy&url=${encodeURIComponent(job.videoUrl)}&filename=${encodeURIComponent(safeDownloadName(job))}`;
 
-  // Fetch a video as a Blob, preferring a direct browser fetch to the PiAPI
-  // CDN (zero backend egress). Falls back to the backend `download_proxy`
-  // endpoint if the direct fetch fails — typically due to CORS. Returns the
-  // Blob and a `source` tag so the caller can log which path was used.
+  // Fetch a video as a Blob via the backend download proxy. We used to try
+  // a direct browser→CDN fetch first, but PiAPI's CDN (storage.theapi.app)
+  // sends no CORS headers, so direct always failed. Backend egress is
+  // effectively free on every host we deploy to (Vercel/Netlify/CF Pages),
+  // so we just always route through the backend now.
   async function fetchVideoBlob(job) {
-    try {
-      const r = await fetch(job.videoUrl, { mode: "cors" });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return { blob: await r.blob(), source: "direct" };
-    } catch (directErr) {
-      const r = await fetch(proxyDownload(job));
-      if (!r.ok) throw new Error(`proxy HTTP ${r.status} (direct: ${directErr.message})`);
-      return { blob: await r.blob(), source: "proxy" };
-    }
+    const r = await fetch(proxyDownload(job));
+    if (!r.ok) throw new Error(`proxy HTTP ${r.status}`);
+    return { blob: await r.blob(), source: "proxy" };
   }
 
   // Save a Blob to disk using the browser's download dialog.
@@ -1069,15 +1064,14 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
-  // Individual-download click handler — tries direct, falls back to proxy
-  // URL navigation (lets the browser stream without holding the blob in
-  // memory, matching the pre-existing behavior when proxy is the only path).
+  // Individual-download click handler — fetches the video via the backend
+  // proxy and saves it as a Blob. On any failure falls back to navigating
+  // to the proxy URL directly so the browser handles the save dialog.
   async function downloadSingle(job) {
     const filename = safeDownloadName(job);
     try {
-      const { blob, source } = await fetchVideoBlob(job);
+      const { blob } = await fetchVideoBlob(job);
       saveBlob(blob, filename);
-      if (source === "proxy") log("info", `[Job ${job.id + 1}] Downloaded via backend proxy (CORS blocked direct)`);
     } catch (err) {
       log("error", `[Job ${job.id + 1}] Download failed: ${err.message}. Falling back to proxy link.`);
       // Last-resort: navigate to the proxy URL. Browser handles the save dialog.
@@ -1103,14 +1097,11 @@ export default function App() {
     let done = 0;
     let ok = 0;
 
-    let directCount = 0;
-    let proxyCount = 0;
     await Promise.all(completed.map(async (job) => {
       try {
-        const { blob, source } = await fetchVideoBlob(job);
+        const { blob } = await fetchVideoBlob(job);
         folder.file(safeDownloadName(job), blob, { compression: "STORE" });
         ok++;
-        if (source === "direct") directCount++; else proxyCount++;
       } catch (err) {
         log("error", `[Job ${job.id + 1}] Download failed: ${err.message}`);
       } finally {
@@ -1119,7 +1110,7 @@ export default function App() {
       }
     }));
     if (ok > 0) {
-      log("info", `Fetched ${directCount} direct, ${proxyCount} via backend proxy`);
+      log("info", `Fetched ${ok} video${ok === 1 ? "" : "s"} via backend`);
     }
 
     if (ok === 0) {
