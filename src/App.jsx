@@ -6,7 +6,13 @@ import JSZip from "jszip";
 // Constants / theme
 // =======================================================================
 
-const POLL_INTERVAL = 8000;
+const JOB_POLL_TICK_INTERVAL = 3000;
+const JOB_POLL_MIN_INTERVAL = 15000;
+const ACCOUNT_MONITOR_TICK_INTERVAL = 30000;
+const ACCOUNT_ACTIVE_INTERVAL = 30000;
+const ACCOUNT_INFO_INTERVAL = 60000;
+const ACCOUNT_HISTORY_INTERVAL = 120000;
+const ACCOUNT_REQUEST_GAP_MS = 2000;
 const MAX_AUTO_RETRIES = 1000;
 const UPLOAD_PROPAGATION_MS = 2000;
 const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
@@ -107,6 +113,10 @@ function formatBytes(n) {
   if (n < 1024) return `${n}B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)}KB`;
   return `${(n / 1024 / 1024).toFixed(2)}MB`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isPlainObject(v) {
@@ -609,6 +619,8 @@ export default function App() {
   const replaceImgRefs = useRef({});
   const jobsRef = useRef([]);
   const pollRef = useRef(null);
+  const jobPollInFlightRef = useRef(false);
+  const jobPollTimesRef = useRef({});
   const refVideoUrlRef = useRef("");
   const refVideoFileRef = useRef(null);
   const refVideoHostRef = useRef(DEFAULT_HOST);
@@ -617,6 +629,7 @@ export default function App() {
   const imageDragCounter = useRef(0);
   const accountRefreshInFlightRef = useRef(false);
   const accountMountedRef = useRef(true);
+  const accountRefreshTimesRef = useRef({ info: 0, active: 0, history: 0 });
 
   const rate = mode === "std" ? 0.065 : 0.104;
   const perVideo = rate * videoDuration;
@@ -718,27 +731,63 @@ export default function App() {
     return json ?? {};
   }
 
-  const refreshAccountMonitor = useCallback(async () => {
+  const refreshAccountMonitor = useCallback(async ({ force = false } = {}) => {
     if (!connected || !apiKey || accountRefreshInFlightRef.current) return;
+    const startedAt = Date.now();
+    const last = accountRefreshTimesRef.current;
+    const steps = [
+      {
+        key: "active",
+        label: "active tasks",
+        due: force || startedAt - last.active >= ACCOUNT_ACTIVE_INTERVAL,
+        action: "active_tasks",
+        apply: (resp) => setAccountActiveTasks(filterKlingTasks(normalizeTaskArray(resp))),
+      },
+      {
+        key: "info",
+        label: "balance",
+        due: force || startedAt - last.info >= ACCOUNT_INFO_INTERVAL,
+        action: "account_info",
+        apply: (resp) => setAccountInfo(normalizeAccountInfo(resp)),
+      },
+      {
+        key: "history",
+        label: "history",
+        due: force || startedAt - last.history >= ACCOUNT_HISTORY_INTERVAL,
+        action: "task_history",
+        apply: (resp) => setAccountHistoryTasks(filterKlingTasks(normalizeTaskArray(resp)).slice(0, 100)),
+      },
+    ].filter((step) => step.due);
+
+    if (steps.length === 0) return;
     accountRefreshInFlightRef.current = true;
     setAccountLoading(true);
 
+    const errors = [];
     try {
-      const [infoResp, activeResp, historyResp] = await Promise.all([
-        proxyJson({ action: "account_info" }),
-        proxyJson({ action: "active_tasks" }),
-        proxyJson({ action: "task_history" }),
-      ]);
-
-      if (!accountMountedRef.current) return;
-      setAccountInfo(normalizeAccountInfo(infoResp));
-      setAccountActiveTasks(filterKlingTasks(normalizeTaskArray(activeResp)));
-      setAccountHistoryTasks(filterKlingTasks(normalizeTaskArray(historyResp)).slice(0, 100));
-      setAccountError("");
-      setAccountLastRefresh(new Date());
-    } catch (err) {
       if (accountMountedRef.current) {
-        setAccountError(err?.message || "PiAPI account refresh failed");
+        setAccountLastRefresh(new Date());
+      }
+
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        try {
+          const resp = await proxyJson({ action: step.action });
+          if (!accountMountedRef.current) return;
+          step.apply(resp);
+          accountRefreshTimesRef.current[step.key] = Date.now();
+        } catch (err) {
+          accountRefreshTimesRef.current[step.key] = Date.now();
+          errors.push(`${step.label}: ${err?.message || "refresh failed"}`);
+        }
+
+        if (i < steps.length - 1) {
+          await sleep(ACCOUNT_REQUEST_GAP_MS);
+        }
+      }
+
+      if (accountMountedRef.current) {
+        setAccountError(errors.join(" | "));
       }
     } finally {
       accountRefreshInFlightRef.current = false;
@@ -756,8 +805,9 @@ export default function App() {
       return undefined;
     }
 
-    refreshAccountMonitor();
-    const id = setInterval(refreshAccountMonitor, POLL_INTERVAL);
+    accountRefreshTimesRef.current = { info: 0, active: 0, history: 0 };
+    refreshAccountMonitor({ force: true });
+    const id = setInterval(refreshAccountMonitor, ACCOUNT_MONITOR_TICK_INTERVAL);
     return () => clearInterval(id);
   }, [apiKey, connected, refreshAccountMonitor]);
 
@@ -1207,6 +1257,8 @@ export default function App() {
       retries: 0,
     }));
     jobsRef.current = initial;
+    jobPollTimesRef.current = {};
+    jobPollInFlightRef.current = false;
     setJobs([...initial]);
     setRunning(true);
     setBatchDone(false);
@@ -1221,6 +1273,7 @@ export default function App() {
     const job = jobsRef.current.find((j) => j.id === id);
     if (!job) return;
     updateJob(id, { retries: 0, jobProxyId: null, jobProxyUrl: null, firstPollLogged: false });
+    delete jobPollTimesRef.current[id];
     if (batchDone) { setBatchDone(false); setRunning(true); }
     const fresh = jobsRef.current.find((j) => j.id === id) || job;
     await submitSingleJob(fresh, refVideoUrlRef.current, { forceReupload: true, attempt: 1 });
@@ -1234,6 +1287,7 @@ export default function App() {
     }
     const preview = await fileToPreview(newFile);
     updateJob(id, { file: newFile, imageName: newFile.name, preview, status: "uploading", imageUrl: null, retries: 0, normalizedFile: null, jobProxyId: null, jobProxyUrl: null, firstPollLogged: false, error: null });
+    delete jobPollTimesRef.current[id];
     const job = jobsRef.current.find((j) => j.id === id);
     if (!job) return;
     if (batchDone) { setBatchDone(false); setRunning(true); }
@@ -1244,6 +1298,8 @@ export default function App() {
   function startPolling() {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
+      if (jobPollInFlightRef.current) return;
+
       const active = jobsRef.current.filter((j) => j.status === "processing");
       if (active.length === 0) {
         const waiting = jobsRef.current.some((j) => ["uploading", "retrying", "pending"].includes(j.status));
@@ -1256,7 +1312,16 @@ export default function App() {
         return;
       }
 
-      for (const job of active) {
+      const now = Date.now();
+      const dueJob = active
+        .filter((j) => now - (jobPollTimesRef.current[j.id] || 0) >= JOB_POLL_MIN_INTERVAL)
+        .sort((a, b) => (jobPollTimesRef.current[a.id] || 0) - (jobPollTimesRef.current[b.id] || 0))[0];
+      if (!dueJob) return;
+
+      jobPollInFlightRef.current = true;
+      jobPollTimesRef.current[dueJob.id] = now;
+
+      for (const job of [dueJob]) {
         try {
           const firstPoll = !job.firstPollLogged;
           if (firstPoll) updateJob(job.id, { firstPollLogged: true });
@@ -1288,12 +1353,15 @@ export default function App() {
           }
         } catch (_) {}
       }
-    }, POLL_INTERVAL);
+      jobPollInFlightRef.current = false;
+    }, JOB_POLL_TICK_INTERVAL);
   }
 
   function resetBatch() {
     setJobs([]);
     jobsRef.current = [];
+    jobPollTimesRef.current = {};
+    jobPollInFlightRef.current = false;
     setBatchDone(false);
     setImages([]);
     setRefVideoFileName("");
@@ -1828,6 +1896,7 @@ export default function App() {
                             <button onClick={() => downloadSingle(job)} style={{ flex: 1, textAlign: "center", padding: "7px 0", borderRadius: 5, background: c.accent + "18", color: c.accent, fontSize: 10, fontWeight: 600, cursor: "pointer", border: `1px solid ${c.accent}30`, fontFamily: "inherit" }}>Download</button>
                             <button onClick={() => {
                               updateJob(job.id, { status: "uploading", videoUrl: null, taskId: null, error: null, imageUrl: null, jobProxyId: null, jobProxyUrl: null, firstPollLogged: false });
+                              delete jobPollTimesRef.current[job.id];
                               submitSingleJob(job, refVideoUrlRef.current, { forceReupload: true, attempt: 1 });
                               if (!pollRef.current) startPolling();
                               log("info", `Regenerating ${job.imageName}`);
