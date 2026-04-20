@@ -7,17 +7,19 @@
  * `tls`, and `fs` will not work.
  *
  * Limitations on Workers runtime:
- *   - SOCKS5 proxying may or may not work depending on current support for
- *     the `net` module. HTTP fetch always works. If SOCKS5 fails on CF, use
- *     HTTP proxy mode in the UI or deploy to Vercel/Netlify/Node instead.
- *   - `formidable` requires writable temp dir; Workers provides one under
- *     /tmp when `nodejs_compat_v2` is enabled.
+ *   - `formidable` is bypassed: multipart bodies are pre-parsed with the
+ *     native `Request.formData()` Web API (see `preparseMultipart` below).
+ *   - `undici` / `https.request` / `socks-proxy-agent` all fail on Workers,
+ *     so proxied HTTP requests are routed through our custom `cfFetch`
+ *     client from `../lib/cf-http.js`, which speaks SOCKS5 and HTTP CONNECT
+ *     directly on top of `cloudflare:sockets`.
  *
  * Route: functions/api/piapi.js → handles /api/piapi for GET + POST.
  */
 
 import { Readable } from 'node:stream';
 import piapiHandler from '../../api/piapi.js';
+import { cfFetch, parseProxyUrl } from '../lib/cf-http.js';
 
 function makeReq(request, url, { skipBody = false } = {}) {
   const headers = {};
@@ -153,6 +155,12 @@ export const onRequest = async ({ request }) => {
     const preparsed = await preparseMultipart(request);
     const req = makeReq(request, url, { skipBody: Boolean(preparsed) });
     if (preparsed) req.__preparsedBody__ = preparsed;
+    // Inject CF-runtime-only helpers. Presence of `__cfFetch__` on the
+    // request is how `api/piapi.js` detects that it's running on Workers
+    // and should route proxied requests through `cfFetch` instead of
+    // `undici` / `https.request`, which don't work here.
+    req.__cfFetch__ = cfFetch;
+    req.__parseProxyUrl__ = parseProxyUrl;
     const { res, toResponse } = makeRes();
     // Kick off handler; it will call res.end/json/send when done.
     const p = piapiHandler(req, res);

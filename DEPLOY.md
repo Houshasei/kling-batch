@@ -6,12 +6,16 @@ Node works out of the box.
 
 ## Quick compatibility matrix
 
-| Host | SPA | Backend | Proxies (HTTP) | Proxies (SOCKS5) | Config files |
-|------|-----|---------|----------------|-------------------|--------------|
-| **Vercel** | ✅ | ✅ native | ✅ | ✅ | `api/piapi.js` (already set) |
-| **Netlify** | ✅ | ✅ Functions | ✅ | ✅ | `netlify.toml`, `netlify/functions/piapi.js` |
-| **Cloudflare Pages** | ✅ | ⚠️ requires flag | ❌ disabled | ⚠️ runtime-dependent | `wrangler.toml`, `functions/api/piapi.js` |
-| **Replit / Render / Railway / Fly / Docker / VPS** | ✅ | ✅ Express | ✅ | ✅ | `server.js`, `.replit` |
+| Host | SPA | Backend | Proxy (SOCKS5 only) | Config files |
+|------|-----|---------|---------------------|--------------|
+| **Vercel** | ✅ | ✅ native | ✅ `socks-proxy-agent` | `api/piapi.js` (already set) |
+| **Netlify** | ✅ | ✅ Functions | ✅ `socks-proxy-agent` | `netlify.toml`, `netlify/functions/piapi.js` |
+| **Cloudflare Pages** | ✅ | ⚠️ requires flag | ✅ custom `cfFetch` client | `wrangler.toml`, `functions/api/piapi.js`, `functions/lib/cf-http.js` |
+| **Replit / Render / Railway / Fly / Docker / VPS** | ✅ | ✅ Express | ✅ `socks-proxy-agent` | `server.js`, `.replit` |
+
+> **HTTP/HTTPS proxies are not supported on any deployment target.**
+> Configure your Webshare plan (or other proxy provider) to emit SOCKS5
+> proxies on port 1080. The UI only accepts `socks5://` URLs.
 
 ---
 
@@ -50,16 +54,24 @@ No env vars required.
 4. The adapter in `functions/api/piapi.js` bridges the Workers `Request`
    to the existing Node handler.
 
-**Known limitations on Cloudflare Pages/Workers:**
+**Notes on Cloudflare Pages/Workers:**
 
-- **HTTP proxy is disabled.** `undici.ProxyAgent` depends on `node:sqlite`,
-  which Workers does not provide. The backend detects the Workers runtime
-  and returns a clear error for any HTTP proxy request. Use SOCKS5 instead,
-  or deploy the backend to Vercel / Netlify / Node for full HTTP proxy
-  support.
-- **SOCKS5** support depends on how complete the Workers `net` module is
-  on your deploy date. It generally works with `nodejs_compat_v2`. If it
-  fails, deploy elsewhere.
+- **Proxies work via a custom HTTP client** (`functions/lib/cf-http.js`).
+  Because Workers' Node-compat shim (`unenv`) does not implement
+  `http.request` / `https.request`, we can't use `undici` or
+  `socks-proxy-agent`. Instead, on Cloudflare we open a raw TCP socket
+  via `cloudflare:sockets`, hand-roll the SOCKS5 or HTTP CONNECT
+  handshake, upgrade to TLS with `startTls()`, and speak HTTP/1.1
+  directly. Vercel / Netlify / Node keep using `undici` and
+  `socks-proxy-agent` unchanged.
+- **CPU time on free tier.** Workers Free plan caps CPU at 10 ms per
+  invocation, which will time out on large proxied uploads and Kling
+  polling under load. **Workers Paid ($5/mo)** raises this to 30 s —
+  comfortably enough for this app's workload. Direct (no-proxy) calls
+  are usually fine on free tier because they're I/O-bound.
+- **Egress is unlimited** on Cloudflare — the main reason to deploy here
+  if the backend's `download_proxy` endpoint burns bandwidth on other
+  hosts.
 
 ---
 

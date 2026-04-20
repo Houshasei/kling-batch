@@ -38,29 +38,18 @@ function buildMultipart(parts) {
   };
 }
 
-// Global `fetch` and `FormData` are available on Node 18+, Cloudflare Workers,
-// Netlify Functions, Vercel Edge/Node, and browsers. We use them directly
-// and only fall back to undici's ProxyAgent when an HTTP proxy is in play.
-//
-// undici is loaded via a variable-path dynamic import so esbuild (Cloudflare's
-// Pages bundler) can't statically trace into its `node:sqlite` cache-store code
-// and will leave it unbundled. On real Node, the import resolves at runtime.
-const UNDICI_MODULE_ID = 'undici';
-let _undiciCache = null;
-async function loadUndici() {
-  if (_undiciCache) return _undiciCache;
-  try {
-    const mod = await import(/* @vite-ignore */ UNDICI_MODULE_ID);
-    _undiciCache = { ok: true, ProxyAgent: mod.ProxyAgent };
-  } catch (err) {
-    _undiciCache = { ok: false, error: err };
-  }
-  return _undiciCache;
-}
+// Global `fetch` is available on Node 18+, Cloudflare Workers, Netlify
+// Functions, Vercel Edge/Node, and browsers. That covers every runtime we
+// ship to; we no longer depend on undici. SOCKS5 is the only supported
+// proxy protocol — HTTP proxies have been removed because Cloudflare's
+// `unenv` doesn't implement `https.request` / `node:sqlite`, forcing us
+// to keep a single tunneling path (`cfFetch` on CF, `socks-proxy-agent`
+// + `https.request` on Node).
 
 // Cloudflare Workers / Pages Functions expose a global `navigator.userAgent`
-// of 'Cloudflare-Workers'. Use that to detect the runtime and refuse HTTP
-// proxy requests up-front with a clear error instead of failing opaquely.
+// of 'Cloudflare-Workers'. Used both to route proxied requests through our
+// custom `cfFetch` client and to fail loudly if the CF adapter hasn't wired
+// it up.
 function isCloudflareWorkers() {
   try {
     const ua = globalThis?.navigator?.userAgent || '';
@@ -155,40 +144,64 @@ function classifyProxyFailure(err, status) {
   return { proxyFailed: false, code: code || undefined, detail };
 }
 
-// Build either an undici Dispatcher (HTTP/HTTPS proxy) or a native https Agent (SOCKS5).
-async function prepProxy(proxyUrl) {
+// Build a proxy handle appropriate for the current runtime. SOCKS5-only.
+//
+//   - On Cloudflare Workers: `req.__cfFetch__` is attached by the Pages
+//     adapter. SOCKS5 proxies route through that custom HTTP client
+//     (see functions/lib/cf-http.js).
+//   - On Node-like runtimes (Vercel/Netlify/Replit/local): `socks-proxy-agent`
+//     + `https.request`.
+//
+// HTTP/HTTPS proxies are rejected outright — Cloudflare's `unenv` shim
+// lacks `node:sqlite` (undici) and `https.request`, so there is no single
+// proxy code path that works everywhere. Configure your Webshare account
+// to expose SOCKS5 proxies instead.
+async function prepProxy(proxyUrl, req) {
   if (!proxyUrl) return {};
   const u = new URL(proxyUrl);
+  const isSocks = u.protocol === 'socks5:' || u.protocol === 'socks:' || u.protocol === 'socks5h:';
 
   if (u.protocol === 'http:' || u.protocol === 'https:') {
-    if (isCloudflareWorkers()) {
-      const e = new Error('HTTP proxy is not supported on Cloudflare Pages/Workers. Use SOCKS5 or deploy the backend to Vercel / Netlify / Node.');
-      e.code = 'ERR_PROXY_HTTP_UNSUPPORTED_ON_CF';
-      throw e;
-    }
-    const undici = await loadUndici();
-    if (!undici.ok) {
-      const e = new Error(`HTTP proxy requires undici, which failed to load on this runtime: ${undici.error?.message || 'unknown error'}`);
-      e.code = 'ERR_PROXY_UNDICI_UNAVAILABLE';
-      throw e;
-    }
-    return { dispatcher: new undici.ProxyAgent(proxyUrl), kind: 'http' };
+    const e = new Error('HTTP/HTTPS proxies are no longer supported. Use a SOCKS5 proxy URL (socks5://user:pass@host:port).');
+    e.code = 'ERR_PROXY_HTTP_REMOVED';
+    throw e;
+  }
+  if (!isSocks) {
+    const e = new Error(`Unsupported proxy protocol: ${u.protocol}`);
+    e.code = 'ERR_PROXY_UNSUPPORTED';
+    throw e;
   }
 
-  if (u.protocol === 'socks5:' || u.protocol === 'socks:' || u.protocol === 'socks5h:') {
-    return {
-      socksAgent: new SocksProxyAgent(proxyUrl, { timeout: 30000 }),
-      kind: 'socks5',
-    };
+  // Cloudflare Workers path: use the injected cfFetch.
+  if (req?.__cfFetch__ && req?.__parseProxyUrl__) {
+    const proxyCfg = req.__parseProxyUrl__(proxyUrl);
+    if (!proxyCfg) {
+      const e = new Error(`Unsupported proxy protocol: ${u.protocol}`);
+      e.code = 'ERR_PROXY_UNSUPPORTED';
+      throw e;
+    }
+    return { kind: 'cf', cfProxy: proxyCfg, cfFetch: req.__cfFetch__ };
   }
 
-  const e = new Error(`Unsupported proxy protocol: ${u.protocol}`);
-  e.code = 'ERR_PROXY_UNSUPPORTED';
-  throw e;
+  // Hard guard: if we're running on Cloudflare but the adapter didn't inject
+  // `__cfFetch__`, we MUST NOT fall through to the Node SOCKS path — that
+  // would try to call `https.request`, which `unenv` doesn't implement,
+  // producing the cryptic `[unenv] https.request is not implemented yet!`
+  // error. Fail loudly with an actionable message instead.
+  if (isCloudflareWorkers()) {
+    const e = new Error('Cloudflare adapter missing: functions/api/piapi.js did not inject cfFetch. Redeploy the Pages project from the current source — the CF proxy runtime needs functions/lib/cf-http.js.');
+    e.code = 'ERR_CF_ADAPTER_MISSING';
+    throw e;
+  }
+
+  // Node-like path.
+  return {
+    socksAgent: new SocksProxyAgent(proxyUrl, { timeout: 30000 }),
+    kind: 'socks5',
+  };
 }
 
 function closeProxy(proxy) {
-  try { proxy?.dispatcher?.close?.(); } catch (_) {}
   try { proxy?.socksAgent?.destroy?.(); } catch (_) {}
 }
 
@@ -237,8 +250,30 @@ function httpsRequestViaSocks(url, { method = 'GET', headers = {}, body, agent, 
   });
 }
 
-async function uploadToLitterbox(buffer, filename, mime, { dispatcher, socksAgent } = {}) {
+async function uploadToLitterbox(buffer, filename, mime, { socksAgent, cfFetch, cfProxy } = {}) {
   const endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
+
+  // Cloudflare runtime — send raw multipart bytes through our custom HTTP
+  // client (supports SOCKS5 and HTTP CONNECT proxies on top of cloudflare:sockets).
+  if (cfFetch) {
+    const { body, headers: mpHeaders } = buildMultipart([
+      { name: 'reqtype', value: 'fileupload' },
+      { name: 'time', value: '1h' },
+      { name: 'fileToUpload', value: buffer, filename, contentType: mime || 'application/octet-stream' },
+    ]);
+    const r = await cfFetch(endpoint, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, Accept: 'text/plain', ...mpHeaders },
+      body,
+      proxy: cfProxy || null,
+    });
+    const text = await r.text();
+    const url = (text || '').trim();
+    if (!r.ok || !/^https?:\/\//i.test(url)) {
+      throw makeUploadError(`Litterbox upload failed (${r.status})`, r.status, text);
+    }
+    return { url, raw: text };
+  }
 
   if (socksAgent) {
     const { body, headers: mpHeaders } = buildMultipart([
@@ -269,7 +304,6 @@ async function uploadToLitterbox(buffer, filename, mime, { dispatcher, socksAgen
     method: 'POST',
     headers: { 'User-Agent': UA, Accept: 'text/plain' },
     body: fd,
-    dispatcher,
   });
   const { text } = await readAsJsonOrText(r);
   const url = (text || '').trim();
@@ -280,8 +314,30 @@ async function uploadToLitterbox(buffer, filename, mime, { dispatcher, socksAgen
   return { url, raw: text };
 }
 
-async function uploadToTmpfile(buffer, filename, mime, { dispatcher, socksAgent } = {}) {
+async function uploadToTmpfile(buffer, filename, mime, { socksAgent, cfFetch, cfProxy } = {}) {
   const endpoint = 'https://tmpfile.link/api/upload';
+
+  if (cfFetch) {
+    const { body, headers: mpHeaders } = buildMultipart([
+      { name: 'file', value: buffer, filename, contentType: mime || 'application/octet-stream' },
+    ]);
+    const r = await cfFetch(endpoint, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, Accept: 'application/json', ...mpHeaders },
+      body,
+      proxy: cfProxy || null,
+    });
+    const text = await r.text();
+    let json; try { json = JSON.parse(text); } catch (_) { json = null; }
+    if (!r.ok) {
+      throw makeUploadError(`tmpfile upload failed (${r.status})`, r.status, text);
+    }
+    const url = json?.downloadLink || json?.data?.downloadLink;
+    if (!url || !/^https?:\/\//i.test(url)) {
+      throw makeUploadError('tmpfile returned invalid response', r.status, text);
+    }
+    return { url, raw: text };
+  }
 
   if (socksAgent) {
     const { body, headers: mpHeaders } = buildMultipart([
@@ -394,7 +450,7 @@ export default async function handler(req, res) {
       let proxy = {};
       if (proxyUrl) {
         try {
-          proxy = await prepProxy(proxyUrl);
+          proxy = await prepProxy(proxyUrl, req);
         } catch (err) {
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true, code: err.code });
         }
@@ -411,10 +467,12 @@ export default async function handler(req, res) {
         const body = isCreate ? JSON.stringify(payload.taskBody) : undefined;
 
         let r;
-        if (proxy.socksAgent) {
+        if (proxy.kind === 'cf') {
+          r = await proxy.cfFetch(url, { method, headers, body, proxy: proxy.cfProxy });
+        } else if (proxy.socksAgent) {
           r = await httpsRequestViaSocks(url, { method, headers, body, agent: proxy.socksAgent });
         } else {
-          r = await fetch(url, { method, headers, body, dispatcher: proxy.dispatcher });
+          r = await fetch(url, { method, headers, body });
         }
         const text = await r.text();
         let d; try { d = JSON.parse(text); } catch (_) { d = { error: text }; }
@@ -470,7 +528,7 @@ export default async function handler(req, res) {
       let proxy = {};
       if (proxyUrl) {
         try {
-          proxy = await prepProxy(proxyUrl);
+          proxy = await prepProxy(proxyUrl, req);
         } catch (err) {
           if (file.filepath) { try { await fs.promises.unlink(file.filepath); } catch (_) {} }
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true, code: err.code });
@@ -479,8 +537,9 @@ export default async function handler(req, res) {
 
       try {
         const { url, raw } = await hostDef.upload(buffer, fileName, mime, {
-          dispatcher: proxy.dispatcher,
           socksAgent: proxy.socksAgent,
+          cfFetch: proxy.kind === 'cf' ? proxy.cfFetch : null,
+          cfProxy: proxy.kind === 'cf' ? proxy.cfProxy : null,
         });
         return res.status(200).json({
           data: {
@@ -528,7 +587,8 @@ export default async function handler(req, res) {
           return res.status(r.status).json({ error: json?.detail || json?.error || `Webshare HTTP ${r.status}`, body: text.slice(0, 500) });
         }
         const results = Array.isArray(json?.results) ? json.results : [];
-        const scheme = protocol === 'socks5' ? 'socks5' : 'http';
+        // HTTP proxies are removed; always request SOCKS5 URLs from Webshare.
+        const scheme = 'socks5';
         for (const p of results) {
           const u = `${scheme}://${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@${p.proxy_address}:${p.port}`;
           proxies.push({ id: String(p.id ?? `${p.proxy_address}:${p.port}`), url: u, country: p.country_code || null });

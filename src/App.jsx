@@ -22,7 +22,10 @@ const STORAGE_USE_PROXY = "kling_batch_use_proxy";
 const STORAGE_WEBSHARE_KEY = "kling_batch_webshare_key";
 const STORAGE_PROXY_PROTOCOL = "kling_batch_proxy_protocol";
 const MAX_PROXY_REROLLS = 5;
-const PROXY_PROTOCOLS = ["http", "socks5"];
+// HTTP proxies have been removed. Only SOCKS5 is supported. This constant
+// remains as a single-element list so existing code paths that pass a
+// `protocol` field continue to work unchanged.
+const PROXY_PROTOCOLS = ["socks5"];
 
 // API base URL — defaults to same-origin /api/piapi. Override with VITE_API_BASE at build time
 // when the SPA and backend live on different origins.
@@ -337,10 +340,10 @@ export default function App() {
   const [useProxy, setUseProxy] = useState(() => localStorage.getItem(STORAGE_USE_PROXY) === "true");
   const [webshareKey, setWebshareKey] = useState(() => localStorage.getItem(STORAGE_WEBSHARE_KEY) || "");
   const [webshareInput, setWebshareInput] = useState("");
-  const [proxyProtocol, setProxyProtocol] = useState(() => {
-    const saved = localStorage.getItem(STORAGE_PROXY_PROTOCOL);
-    return PROXY_PROTOCOLS.includes(saved) ? saved : "socks5";
-  });
+  // SOCKS5 is the only supported protocol now. The setter still exists
+  // (kept as state for forward-compat) but the UI no longer exposes a
+  // choice. Stored "http" values are silently upgraded on load.
+  const [proxyProtocol, setProxyProtocol] = useState("socks5");
   const [proxyCount, setProxyCount] = useState(0);
   const [proxyLoading, setProxyLoading] = useState(false);
   const [proxyError, setProxyError] = useState("");
@@ -460,7 +463,53 @@ export default function App() {
     );
   }
 
+  // Browser → Host direct upload. Zero backend egress. Works only when the
+  // host sends permissive CORS headers (Litterbox does). Throws on any
+  // failure so the caller can fall back to the backend path.
+  async function uploadDirectTo(host, file) {
+    if (host === "litterbox") {
+      const fd = new FormData();
+      fd.append("reqtype", "fileupload");
+      fd.append("time", "1h");
+      fd.append("fileToUpload", file);
+      const r = await fetch("https://litterbox.catbox.moe/resources/internals/api.php", {
+        method: "POST",
+        body: fd,
+      });
+      if (!r.ok) throw new Error(`litterbox HTTP ${r.status}`);
+      const url = (await r.text()).trim();
+      if (!/^https?:\/\//i.test(url)) throw new Error(`litterbox returned non-URL: ${truncate(url, 120)}`);
+      return url;
+    }
+    if (host === "tmpfile") {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch("https://tmpfile.link/api/upload", { method: "POST", body: fd });
+      if (!r.ok) throw new Error(`tmpfile HTTP ${r.status}`);
+      const json = await r.json().catch(() => null);
+      // Prefer the URL-encoded variant so filenames with spaces / unicode /
+      // reserved characters don't break downstream consumers (e.g. Kling).
+      const url = json?.downloadLinkEncoded || json?.downloadLink
+                || json?.data?.downloadLinkEncoded || json?.data?.downloadLink;
+      if (!url || !/^https?:\/\//i.test(url)) throw new Error("tmpfile returned invalid response");
+      return url;
+    }
+    throw new Error(`No direct-upload path for host "${host}"`);
+  }
+
   async function uploadViaProxy(file, host, proxyUrl) {
+    // When no proxy is configured, try a direct browser→host upload first
+    // to save backend bandwidth. Falls back to the backend path on any
+    // failure (CORS block, network error, rate-limit, etc.).
+    if (!proxyUrl) {
+      try {
+        const url = await uploadDirectTo(host, file);
+        return { url, finalHost: host };
+      } catch (_) {
+        // Fall through to backend upload.
+      }
+    }
+
     const fd = new FormData();
     fd.append("file", file);
     fd.append("action", "upload_file");
@@ -609,15 +658,9 @@ export default function App() {
     proxyPoolRef.current = null;
   }
 
-  async function handleChangeProtocol(next) {
-    if (!PROXY_PROTOCOLS.includes(next) || next === proxyProtocol) return;
-    setProxyProtocol(next);
-    proxyPoolRef.current = null;
-    setProxyCount(0);
-    if (useProxy && webshareKey) {
-      await loadProxies(webshareKey, { silent: false, protocol: next });
-    }
-  }
+  // handleChangeProtocol removed: HTTP proxies are no longer supported, so
+  // there is no protocol to switch between. SOCKS5 is hardcoded in the
+  // request builder.
 
   // =====================================================================
   // Kling task lifecycle
@@ -982,6 +1025,55 @@ export default function App() {
   const safeDownloadName = (job) => `${safeBase(job.imageName)}.mp4`;
   const proxyDownload = (job) => `${API_BASE}?action=download_proxy&url=${encodeURIComponent(job.videoUrl)}&filename=${encodeURIComponent(safeDownloadName(job))}`;
 
+  // Fetch a video as a Blob, preferring a direct browser fetch to the PiAPI
+  // CDN (zero backend egress). Falls back to the backend `download_proxy`
+  // endpoint if the direct fetch fails — typically due to CORS. Returns the
+  // Blob and a `source` tag so the caller can log which path was used.
+  async function fetchVideoBlob(job) {
+    try {
+      const r = await fetch(job.videoUrl, { mode: "cors" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return { blob: await r.blob(), source: "direct" };
+    } catch (directErr) {
+      const r = await fetch(proxyDownload(job));
+      if (!r.ok) throw new Error(`proxy HTTP ${r.status} (direct: ${directErr.message})`);
+      return { blob: await r.blob(), source: "proxy" };
+    }
+  }
+
+  // Save a Blob to disk using the browser's download dialog.
+  function saveBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  // Individual-download click handler — tries direct, falls back to proxy
+  // URL navigation (lets the browser stream without holding the blob in
+  // memory, matching the pre-existing behavior when proxy is the only path).
+  async function downloadSingle(job) {
+    const filename = safeDownloadName(job);
+    try {
+      const { blob, source } = await fetchVideoBlob(job);
+      saveBlob(blob, filename);
+      if (source === "proxy") log("info", `[Job ${job.id + 1}] Downloaded via backend proxy (CORS blocked direct)`);
+    } catch (err) {
+      log("error", `[Job ${job.id + 1}] Download failed: ${err.message}. Falling back to proxy link.`);
+      // Last-resort: navigate to the proxy URL. Browser handles the save dialog.
+      const link = document.createElement("a");
+      link.href = proxyDownload(job);
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  }
+
   async function downloadAllZip() {
     if (zipProgress.phase !== "idle" && zipProgress.phase !== "done") return;
     const completed = jobs.filter((j) => j.status === "completed");
@@ -995,13 +1087,14 @@ export default function App() {
     let done = 0;
     let ok = 0;
 
+    let directCount = 0;
+    let proxyCount = 0;
     await Promise.all(completed.map(async (job) => {
       try {
-        const r = await fetch(proxyDownload(job));
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const blob = await r.blob();
+        const { blob, source } = await fetchVideoBlob(job);
         folder.file(safeDownloadName(job), blob, { compression: "STORE" });
         ok++;
+        if (source === "direct") directCount++; else proxyCount++;
       } catch (err) {
         log("error", `[Job ${job.id + 1}] Download failed: ${err.message}`);
       } finally {
@@ -1009,6 +1102,9 @@ export default function App() {
         setZipProgress({ phase: "downloading", done, total: completed.length, percent: Math.round((done / completed.length) * 100) });
       }
     }));
+    if (ok > 0) {
+      log("info", `Fetched ${directCount} direct, ${proxyCount} via backend proxy`);
+    }
 
     if (ok === 0) {
       log("error", `ZIP aborted: no videos downloaded`);
@@ -1208,20 +1304,8 @@ export default function App() {
                 <div style={{ fontSize: 10, color: c.success, fontFamily: mono }}>
                   ✓ Webshare connected — {proxyCount || "…"} proxies
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ fontSize: 9, color: c.muted, fontFamily: mono }}>Protocol</span>
-                  <select
-                    value={proxyProtocol}
-                    onChange={(e) => handleChangeProtocol(e.target.value)}
-                    disabled={running || proxyLoading}
-                    style={{ flex: 1, background: c.surface, border: `1px solid ${c.border}`, borderRadius: 4, padding: "3px 6px", color: c.text, fontFamily: mono, fontSize: 10, outline: "none" }}
-                  >
-                    <option value="http">HTTP</option>
-                    <option value="socks5">SOCKS5</option>
-                  </select>
-                </div>
-                <div style={{ fontSize: 9, color: c.hint, lineHeight: 1.4 }}>
-                  SOCKS5 requires a Webshare plan with SOCKS5 enabled.
+                <div style={{ fontSize: 9, color: c.hint, lineHeight: 1.4, fontFamily: mono }}>
+                  Protocol: SOCKS5 · enable SOCKS5 in your Webshare plan.
                 </div>
                 {proxyPoolRef.current && (
                   <div style={{ fontSize: 9, color: c.hint, fontFamily: mono }}>
@@ -1429,7 +1513,7 @@ export default function App() {
                       {job.videoUrl && (
                         <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
                           <div style={{ display: "flex", gap: 4 }}>
-                            <a href={proxyDownload(job)} download={safeDownloadName(job)} style={{ flex: 1, textAlign: "center", padding: "7px 0", borderRadius: 5, background: c.accent + "18", color: c.accent, fontSize: 10, fontWeight: 600, textDecoration: "none", border: `1px solid ${c.accent}30` }}>Download</a>
+                            <button onClick={() => downloadSingle(job)} style={{ flex: 1, textAlign: "center", padding: "7px 0", borderRadius: 5, background: c.accent + "18", color: c.accent, fontSize: 10, fontWeight: 600, cursor: "pointer", border: `1px solid ${c.accent}30`, fontFamily: "inherit" }}>Download</button>
                             <button onClick={() => {
                               updateJob(job.id, { status: "uploading", videoUrl: null, taskId: null, error: null, imageUrl: null, jobProxyId: null, jobProxyUrl: null, firstPollLogged: false });
                               submitSingleJob(job, refVideoUrlRef.current, { forceReupload: true, attempt: 1 });
