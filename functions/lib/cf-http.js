@@ -233,15 +233,22 @@ async function doHttpConnectHandshake(sock, proxy, targetHost, targetPort) {
 // Tunnel opener
 // =============================================================================
 
-async function openTunnel(proxy, targetHost, targetPort) {
-  if (!proxy) return connect({ hostname: targetHost, port: targetPort });
+async function openTunnel(proxy, targetHost, targetPort, { willStartTls = false } = {}) {
+  // Cloudflare's `connect()` requires `secureTransport: 'starttls'` at
+  // connect-time if the caller plans to invoke `socket.startTls()` later.
+  // Without it, startTls throws:
+  //   "The `secureTransport` socket option must be set to 'starttls'
+  //    for startTls to be used."
+  const opts = willStartTls ? { secureTransport: 'starttls' } : {};
+
+  if (!proxy) return connect({ hostname: targetHost, port: targetPort, ...opts });
 
   // HTTPS proxies would need TLS before the CONNECT handshake — rare for
   // HTTP proxies, non-existent for SOCKS5. We don't support proxyTls=true
   // yet; throw cleanly instead of silently doing the wrong thing.
   if (proxy.proxyTls) throw new Error('HTTPS-to-proxy (proxy URL with https://) is not supported on Cloudflare yet');
 
-  const sock = connect({ hostname: proxy.host, port: proxy.port });
+  const sock = connect({ hostname: proxy.host, port: proxy.port, ...opts });
   if (proxy.kind === 'socks5') {
     await doSocks5Handshake(sock, proxy, targetHost, targetPort);
   } else if (proxy.kind === 'http') {
@@ -393,7 +400,7 @@ export async function cfFetch(url, { method = 'GET', headers = {}, body = null, 
   const pathAndQuery = (u.pathname || '/') + (u.search || '');
   const hostHeader = u.port ? `${u.hostname}:${u.port}` : u.hostname;
 
-  const rawSocket = await openTunnel(proxy, targetHost, targetPort);
+  const rawSocket = await openTunnel(proxy, targetHost, targetPort, { willStartTls: isHttps });
   const socket = isHttps
     ? rawSocket.startTls({ expectedServerHostname: targetHost })
     : rawSocket;

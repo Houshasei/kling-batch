@@ -368,7 +368,6 @@ async function uploadToTmpfile(buffer, filename, mime, { socksAgent, cfFetch, cf
     method: 'POST',
     headers: { 'User-Agent': UA, Accept: 'application/json' },
     body: fd,
-    dispatcher,
   });
   const { json, text } = await readAsJsonOrText(r);
 
