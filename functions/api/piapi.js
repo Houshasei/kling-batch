@@ -19,7 +19,7 @@
 import { Readable } from 'node:stream';
 import piapiHandler from '../../api/piapi.js';
 
-function makeReq(request, url) {
+function makeReq(request, url, { skipBody = false } = {}) {
   const headers = {};
   for (const [k, v] of request.headers.entries()) headers[k.toLowerCase()] = v;
 
@@ -27,7 +27,7 @@ function makeReq(request, url) {
   for (const [k, v] of url.searchParams.entries()) query[k] = v;
 
   let stream;
-  if (request.body) {
+  if (!skipBody && request.body) {
     const reader = request.body.getReader();
     stream = new Readable({
       async read() {
@@ -41,6 +41,9 @@ function makeReq(request, url) {
       },
     });
   } else {
+    // Either the body was consumed upstream (e.g. by request.formData()) or
+    // there is no body. Provide an empty readable so `req.on('data'|'end')`
+    // still resolves if anything tries to read it.
     stream = Readable.from([Buffer.alloc(0)]);
   }
 
@@ -112,11 +115,14 @@ function makeRes() {
 // Pre-parse multipart/form-data using the Web `Request.formData()` API so we
 // never hit `formidable` on the Workers runtime (formidable requires
 // `fs.createWriteStream` for temp files, which Workers does not support even
-// with `nodejs_compat_v2`). Result is attached to `req.__preparsedBody__` and
-// `api/piapi.js` short-circuits `parseRequestBody` when that marker is set.
-async function maybePreparseMultipart(request, req) {
+// with `nodejs_compat_v2`). Returns a formidable-shaped object, or null if
+// the request is not multipart.
+//
+// IMPORTANT: this consumes the request body, so it MUST run before `makeReq`
+// locks the ReadableStream via `body.getReader()`.
+async function preparseMultipart(request) {
   const ct = (request.headers.get('content-type') || '').toLowerCase();
-  if (!ct.startsWith('multipart/form-data')) return;
+  if (!ct.startsWith('multipart/form-data')) return null;
 
   const fd = await request.formData();
   const fields = {};
@@ -137,14 +143,16 @@ async function maybePreparseMultipart(request, req) {
       fields[key] = String(value);
     }
   }
-  req.__preparsedBody__ = { fields, files, isFormData: true };
+  return { fields, files, isFormData: true };
 }
 
 export const onRequest = async ({ request }) => {
   try {
     const url = new URL(request.url);
-    const req = makeReq(request, url);
-    await maybePreparseMultipart(request, req);
+    // Consume the body FIRST for multipart so we don't lock the stream twice.
+    const preparsed = await preparseMultipart(request);
+    const req = makeReq(request, url, { skipBody: Boolean(preparsed) });
+    if (preparsed) req.__preparsedBody__ = preparsed;
     const { res, toResponse } = makeRes();
     // Kick off handler; it will call res.end/json/send when done.
     const p = piapiHandler(req, res);
