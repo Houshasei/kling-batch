@@ -66,6 +66,12 @@ export const config = {
 };
 
 const UA = 'kling-batch/1.0 (+https://github.com/Houshasei/kling-batch)';
+const API_KEY_ACTIONS = new Set(['create', 'poll', 'account_info', 'active_tasks', 'task_history']);
+const ACCOUNT_ACTION_URLS = {
+  account_info: 'https://api.piapi.ai/account/info',
+  active_tasks: 'https://api.piapi.ai/account/active_tasks',
+  task_history: 'https://api.piapi.ai/api/open/tasks/histories?page=1&page_size=100&model=kling',
+};
 
 async function readAsJsonOrText(response) {
   const text = await response.text();
@@ -461,12 +467,25 @@ export default async function handler(req, res) {
     ({ action, apiKey, host, proxyUrl, webshareKey, protocol, ...payload } = parsed.body || {});
   }
 
-  const needsApiKey = ['create', 'poll'].includes(action);
+  const needsApiKey = API_KEY_ACTIONS.has(action);
   if (needsApiKey && !apiKey) {
     return res.status(400).json({ error: 'Missing API key' });
   }
 
   try {
+    if (ACCOUNT_ACTION_URLS[action]) {
+      const r = await fetch(ACCOUNT_ACTION_URLS[action], {
+        method: 'GET',
+        headers: {
+          'x-api-key': apiKey,
+          Accept: 'application/json',
+        },
+      });
+      const text = await r.text();
+      let d; try { d = JSON.parse(text); } catch (_) { d = null; }
+      return res.status(r.status).json(d || { error: text || `PiAPI HTTP ${r.status}` });
+    }
+
     if (action === 'create' || action === 'poll') {
       let proxy = {};
       if (proxyUrl) {
