@@ -1,9 +1,40 @@
 import formidable from 'formidable';
 import fs from 'fs';
 import https from 'https';
-import { fetch, FormData, ProxyAgent } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import NodeFormData from 'form-data';
+
+// Global `fetch` and `FormData` are available on Node 18+, Cloudflare Workers,
+// Netlify Functions, Vercel Edge/Node, and browsers. We use them directly
+// and only fall back to undici's ProxyAgent when an HTTP proxy is in play.
+//
+// undici is loaded via a variable-path dynamic import so esbuild (Cloudflare's
+// Pages bundler) can't statically trace into its `node:sqlite` cache-store code
+// and will leave it unbundled. On real Node, the import resolves at runtime.
+const UNDICI_MODULE_ID = 'undici';
+let _undiciCache = null;
+async function loadUndici() {
+  if (_undiciCache) return _undiciCache;
+  try {
+    const mod = await import(/* @vite-ignore */ UNDICI_MODULE_ID);
+    _undiciCache = { ok: true, ProxyAgent: mod.ProxyAgent };
+  } catch (err) {
+    _undiciCache = { ok: false, error: err };
+  }
+  return _undiciCache;
+}
+
+// Cloudflare Workers / Pages Functions expose a global `navigator.userAgent`
+// of 'Cloudflare-Workers'. Use that to detect the runtime and refuse HTTP
+// proxy requests up-front with a clear error instead of failing opaquely.
+function isCloudflareWorkers() {
+  try {
+    const ua = globalThis?.navigator?.userAgent || '';
+    return ua.includes('Cloudflare-Workers');
+  } catch (_) {
+    return false;
+  }
+}
 
 export const config = {
   api: {
@@ -87,12 +118,23 @@ function classifyProxyFailure(err, status) {
 }
 
 // Build either an undici Dispatcher (HTTP/HTTPS proxy) or a native https Agent (SOCKS5).
-function prepProxy(proxyUrl) {
+async function prepProxy(proxyUrl) {
   if (!proxyUrl) return {};
   const u = new URL(proxyUrl);
 
   if (u.protocol === 'http:' || u.protocol === 'https:') {
-    return { dispatcher: new ProxyAgent(proxyUrl), kind: 'http' };
+    if (isCloudflareWorkers()) {
+      const e = new Error('HTTP proxy is not supported on Cloudflare Pages/Workers. Use SOCKS5 or deploy the backend to Vercel / Netlify / Node.');
+      e.code = 'ERR_PROXY_HTTP_UNSUPPORTED_ON_CF';
+      throw e;
+    }
+    const undici = await loadUndici();
+    if (!undici.ok) {
+      const e = new Error(`HTTP proxy requires undici, which failed to load on this runtime: ${undici.error?.message || 'unknown error'}`);
+      e.code = 'ERR_PROXY_UNDICI_UNAVAILABLE';
+      throw e;
+    }
+    return { dispatcher: new undici.ProxyAgent(proxyUrl), kind: 'http' };
   }
 
   if (u.protocol === 'socks5:' || u.protocol === 'socks:' || u.protocol === 'socks5h:') {
@@ -312,9 +354,9 @@ export default async function handler(req, res) {
       let proxy = {};
       if (proxyUrl) {
         try {
-          proxy = prepProxy(proxyUrl);
+          proxy = await prepProxy(proxyUrl);
         } catch (err) {
-          return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true });
+          return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true, code: err.code });
         }
       }
       try {
@@ -385,10 +427,10 @@ export default async function handler(req, res) {
       let proxy = {};
       if (proxyUrl) {
         try {
-          proxy = prepProxy(proxyUrl);
+          proxy = await prepProxy(proxyUrl);
         } catch (err) {
           try { await fs.promises.unlink(file.filepath); } catch (_) {}
-          return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true });
+          return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true, code: err.code });
         }
       }
 

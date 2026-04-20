@@ -51,10 +51,16 @@ No env vars required.
 4. The adapter in `functions/api/piapi.js` bridges the Workers `Request`
    to the existing Node handler.
 
-**Known limitation:** SOCKS5 proxy support depends on how complete the
-Workers `net` module is on the date of deploy. If SOCKS5 fails on
-Cloudflare, switch the UI proxy protocol to **HTTP** (still works), or
-deploy elsewhere.
+**Known limitations on Cloudflare Pages/Workers:**
+
+- **HTTP proxy is disabled.** `undici.ProxyAgent` depends on `node:sqlite`,
+  which Workers does not provide. The backend detects the Workers runtime
+  and returns a clear error for any HTTP proxy request. Use SOCKS5 instead,
+  or deploy the backend to Vercel / Netlify / Node for full HTTP proxy
+  support.
+- **SOCKS5** support depends on how complete the Workers `net` module is
+  on your deploy date. It generally works with `nodejs_compat_v2`. If it
+  fails, deploy elsewhere.
 
 ---
 
