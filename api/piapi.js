@@ -158,6 +158,18 @@ function classifyProxyFailure(err, status) {
 // to expose SOCKS5 proxies instead.
 async function prepProxy(proxyUrl, req) {
   if (!proxyUrl) return {};
+
+  // Cloudflare Pages / Workers: proxies are disabled entirely. The
+  // `cloudflare:sockets` runtime adds too much latency and unreliability
+  // when tunneling through SOCKS5, and tmpfile/litterbox's CDN blocks most
+  // of the residential IPs Webshare hands out anyway. Silently drop the
+  // proxy and fall through to the direct-egress path (CF's own network).
+  // `proxyDroppedOnCF: true` is surfaced in the response so the SPA can
+  // optionally show a one-time notice.
+  if (isCloudflareWorkers()) {
+    return { proxyDroppedOnCF: true };
+  }
+
   const u = new URL(proxyUrl);
   const isSocks = u.protocol === 'socks5:' || u.protocol === 'socks:' || u.protocol === 'socks5h:';
 
@@ -541,6 +553,7 @@ export default async function handler(req, res) {
           cfProxy: proxy.kind === 'cf' ? proxy.cfProxy : null,
         });
         return res.status(200).json({
+          proxyDroppedOnCF: proxy.proxyDroppedOnCF || false,
           data: {
             fileName,
             downloadLink: url,

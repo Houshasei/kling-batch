@@ -481,18 +481,12 @@ export default function App() {
       if (!/^https?:\/\//i.test(url)) throw new Error(`litterbox returned non-URL: ${truncate(url, 120)}`);
       return url;
     }
+    // tmpfile.link: client-direct upload disabled. Their CDN (Cloudflare in
+    // front of the API) intercepts anonymous POSTs from browsers, so the
+    // backend path is the only reliable route. The caller below will fall
+    // through to `uploadViaProxy` → backend when this throws.
     if (host === "tmpfile") {
-      const fd = new FormData();
-      fd.append("file", file);
-      const r = await fetch("https://tmpfile.link/api/upload", { method: "POST", body: fd });
-      if (!r.ok) throw new Error(`tmpfile HTTP ${r.status}`);
-      const json = await r.json().catch(() => null);
-      // Prefer the URL-encoded variant so filenames with spaces / unicode /
-      // reserved characters don't break downstream consumers (e.g. Kling).
-      const url = json?.downloadLinkEncoded || json?.downloadLink
-                || json?.data?.downloadLinkEncoded || json?.data?.downloadLink;
-      if (!url || !/^https?:\/\//i.test(url)) throw new Error("tmpfile returned invalid response");
-      return url;
+      throw new Error("tmpfile: client-direct upload disabled, using backend");
     }
     throw new Error(`No direct-upload path for host "${host}"`);
   }

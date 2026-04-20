@@ -10,7 +10,7 @@ Node works out of the box.
 |------|-----|---------|---------------------|--------------|
 | **Vercel** | ✅ | ✅ native | ✅ `socks-proxy-agent` | `api/piapi.js` (already set) |
 | **Netlify** | ✅ | ✅ Functions | ✅ `socks-proxy-agent` | `netlify.toml`, `netlify/functions/piapi.js` |
-| **Cloudflare Pages** | ✅ | ⚠️ requires flag | ✅ custom `cfFetch` client | `wrangler.toml`, `functions/api/piapi.js`, `functions/lib/cf-http.js` |
+| **Cloudflare Pages** | ✅ | ⚠️ requires flag | ❌ disabled — direct egress only | `wrangler.toml`, `functions/api/piapi.js` |
 | **Replit / Render / Railway / Fly / Docker / VPS** | ✅ | ✅ Express | ✅ `socks-proxy-agent` | `server.js`, `.replit` |
 
 > **HTTP/HTTPS proxies are not supported on any deployment target.**
