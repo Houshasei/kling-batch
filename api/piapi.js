@@ -400,9 +400,83 @@ async function uploadToTmpfile(buffer, filename, mime, { socksAgent, cfFetch, cf
 }
 
 // Host registry — add a new host by adding one entry + one uploader above.
+function normalizeTmpfilesUrl(url) {
+  const u = new URL(url);
+  if (u.hostname === 'tmpfiles.org' && !u.pathname.startsWith('/dl/')) {
+    u.pathname = `/dl${u.pathname.startsWith('/') ? '' : '/'}${u.pathname}`;
+  }
+  return u.toString();
+}
+
+function extractTmpfilesUrl(text, status) {
+  let json; try { json = JSON.parse(text); } catch (_) { json = null; }
+  const rawUrl = json?.data?.url || json?.url;
+  if (json?.status && json.status !== 'success') {
+    throw makeUploadError(`tmpfiles.org upload failed: ${json?.message || json?.error || json.status}`, status, text);
+  }
+  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+    throw makeUploadError('tmpfiles.org returned invalid response', status, text);
+  }
+  return normalizeTmpfilesUrl(rawUrl);
+}
+
+async function uploadToTmpfiles(buffer, filename, mime, { socksAgent, cfFetch, cfProxy } = {}) {
+  const endpoint = 'https://tmpfiles.org/api/v1/upload';
+
+  if (cfFetch) {
+    const { body, headers: mpHeaders } = buildMultipart([
+      { name: 'file', value: buffer, filename, contentType: mime || 'application/octet-stream' },
+    ]);
+    const r = await cfFetch(endpoint, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, Accept: 'application/json', ...mpHeaders },
+      body,
+      proxy: cfProxy || null,
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      throw makeUploadError(`tmpfiles.org upload failed (${r.status})`, r.status, text);
+    }
+    return { url: extractTmpfilesUrl(text, r.status), raw: text };
+  }
+
+  if (socksAgent) {
+    const { body, headers: mpHeaders } = buildMultipart([
+      { name: 'file', value: buffer, filename, contentType: mime || 'application/octet-stream' },
+    ]);
+    const r = await httpsRequestViaSocks(endpoint, {
+      method: 'POST',
+      headers: { 'User-Agent': UA, Accept: 'application/json', ...mpHeaders },
+      body,
+      agent: socksAgent,
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      throw makeUploadError(`tmpfiles.org upload failed (${r.status})`, r.status, text);
+    }
+    return { url: extractTmpfilesUrl(text, r.status), raw: text };
+  }
+
+  const fd = new FormData();
+  fd.append('file', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename);
+
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'User-Agent': UA, Accept: 'application/json' },
+    body: fd,
+  });
+  const { text } = await readAsJsonOrText(r);
+
+  if (!r.ok) {
+    throw makeUploadError(`tmpfiles.org upload failed (${r.status})`, r.status, text);
+  }
+  return { url: extractTmpfilesUrl(text, r.status), raw: text };
+}
+
 const HOSTS = {
   litterbox: { upload: uploadToLitterbox },
   tmpfile: { upload: uploadToTmpfile },
+  tmpfiles: { upload: uploadToTmpfiles },
 };
 
 export default async function handler(req, res) {

@@ -52,6 +52,7 @@ const c = {
 const HOST_OPTIONS = [
   { id: "litterbox", label: "Litterbox \u00B7 1h", maxConcurrent: 4 },
   { id: "tmpfile", label: "tmpfile.link", maxConcurrent: 8 },
+  { id: "tmpfiles", label: "tmpfiles.org \u00B7 1h", maxConcurrent: 8 },
 ];
 const DEFAULT_HOST = "litterbox";
 
@@ -790,8 +791,8 @@ export default function App() {
     // front of the API) intercepts anonymous POSTs from browsers, so the
     // backend path is the only reliable route. The caller below will fall
     // through to `uploadViaProxy` → backend when this throws.
-    if (host === "tmpfile") {
-      throw new Error("tmpfile: client-direct upload disabled, using backend");
+    if (host === "tmpfile" || host === "tmpfiles") {
+      throw new Error(`${host}: client-direct upload disabled, using backend`);
     }
     throw new Error(`No direct-upload path for host "${host}"`);
   }
@@ -1456,7 +1457,7 @@ export default function App() {
           <div style={{ width: 30, height: 30, borderRadius: 7, background: c.accent, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 700, color: "#fff" }}>K</div>
           <div>
             <div style={{ fontSize: 14, fontWeight: 600 }}>Kling Batch Motion Control</div>
-            <div style={{ fontSize: 10, color: c.hint, fontFamily: mono }}>v2.6 · Litterbox / tmpfile.link · concurrent · auto-retry</div>
+            <div style={{ fontSize: 10, color: c.hint, fontFamily: mono }}>v2.6 · Litterbox / tmpfile.link / tmpfiles.org · concurrent · auto-retry</div>
           </div>
         </div>
         {!connected ? (
