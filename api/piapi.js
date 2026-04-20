@@ -403,6 +403,16 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     const { action, url, filename } = req.query || {};
 
+    // Lightweight capability probe used by the SPA at boot to hide features
+    // that are unsupported on the current runtime (e.g. proxy UI on CF).
+    if (action === 'runtime_info') {
+      const cf = isCloudflareWorkers();
+      return res.status(200).json({
+        runtime: cf ? 'cloudflare' : 'node',
+        proxySupported: !cf,
+      });
+    }
+
     if (action !== 'download_proxy') {
       return res.status(405).json({ error: 'Method not allowed' });
     }

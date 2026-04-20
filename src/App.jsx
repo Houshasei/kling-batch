@@ -338,6 +338,11 @@ export default function App() {
   });
 
   const [useProxy, setUseProxy] = useState(() => localStorage.getItem(STORAGE_USE_PROXY) === "true");
+  // Runtime capability probe — populated once at boot. On Cloudflare Pages
+  // the backend ignores proxies (see `prepProxy`), so we hide the proxy UI
+  // entirely to avoid misleading users into thinking it does anything.
+  const [runtimeInfo, setRuntimeInfo] = useState({ runtime: "unknown", proxySupported: true });
+  const proxySupported = runtimeInfo.proxySupported;
   const [webshareKey, setWebshareKey] = useState(() => localStorage.getItem(STORAGE_WEBSHARE_KEY) || "");
   const [webshareInput, setWebshareInput] = useState("");
   // SOCKS5 is the only supported protocol now. The setter still exists
@@ -397,6 +402,23 @@ export default function App() {
   useEffect(() => { localStorage.setItem(STORAGE_USE_PROXY, useProxy ? "true" : "false"); }, [useProxy]);
   useEffect(() => { localStorage.setItem(STORAGE_WEBSHARE_KEY, webshareKey || ""); }, [webshareKey]);
   useEffect(() => { localStorage.setItem(STORAGE_PROXY_PROTOCOL, proxyProtocol); }, [proxyProtocol]);
+
+  // Probe the backend once at mount to learn the runtime. If the probe
+  // fails (older deploy without the endpoint, offline, etc.) we assume a
+  // Node runtime with proxy support — the safe default for every host
+  // except Cloudflare.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}?action=runtime_info`);
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!cancelled && j && typeof j === "object") setRuntimeInfo(j);
+      } catch (_) { /* assume Node defaults */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Global drop guard
   useEffect(() => {
@@ -1245,7 +1267,17 @@ export default function App() {
             </select>
           </div>
 
-          {/* Proxy section */}
+          {/* Proxy section — hidden on runtimes that don't support proxies
+              (Cloudflare Pages). The backend ignores proxy URLs there, so
+              exposing a toggle would just be misleading. */}
+          {!proxySupported ? (
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted, marginBottom: 6 }}>Upload proxy</div>
+              <div style={{ fontSize: 10, color: c.hint, fontFamily: mono, lineHeight: 1.5, padding: "6px 8px", background: c.surface, border: `1px dashed ${c.border}`, borderRadius: 4 }}>
+                Disabled on Cloudflare Pages · all requests use direct egress.
+              </div>
+            </div>
+          ) : (
           <div>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
               <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted }}>Upload proxy</div>
@@ -1326,6 +1358,7 @@ export default function App() {
               </div>
             )}
           </div>
+          )}
 
           {/* Logs */}
           <div style={{ background: c.surface, borderRadius: 7, border: `1px solid ${c.border}` }}>
