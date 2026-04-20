@@ -7,7 +7,7 @@ import JSZip from "jszip";
 // =======================================================================
 
 const POLL_INTERVAL = 8000;
-const MAX_AUTO_RETRIES = 5;
+const MAX_AUTO_RETRIES = 3;
 const UPLOAD_PROPAGATION_MS = 2000;
 const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
