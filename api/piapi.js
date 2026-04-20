@@ -2,7 +2,41 @@ import formidable from 'formidable';
 import fs from 'fs';
 import https from 'https';
 import { SocksProxyAgent } from 'socks-proxy-agent';
-import NodeFormData from 'form-data';
+
+// Hand-rolled multipart/form-data builder. Used on the SOCKS5 path (which
+// pipes raw bytes through `https.request` and can't use the Web-standard
+// `fetch` + `FormData` combo) and anywhere we need deterministic bytes
+// without pulling in the `form-data` npm package, whose `.getHeaders()` is
+// broken on Cloudflare Workers' `nodejs_compat_v2` shim.
+function buildMultipart(parts) {
+  const boundary = `----KlingBatchBoundary${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  const CRLF = '\r\n';
+  const chunks = [];
+  for (const p of parts) {
+    chunks.push(Buffer.from(`--${boundary}${CRLF}`));
+    if (p.filename != null) {
+      chunks.push(Buffer.from(
+        `Content-Disposition: form-data; name="${p.name}"; filename="${p.filename}"${CRLF}` +
+        `Content-Type: ${p.contentType || 'application/octet-stream'}${CRLF}${CRLF}`,
+      ));
+      chunks.push(Buffer.isBuffer(p.value) ? p.value : Buffer.from(p.value));
+    } else {
+      chunks.push(Buffer.from(
+        `Content-Disposition: form-data; name="${p.name}"${CRLF}${CRLF}${String(p.value)}`,
+      ));
+    }
+    chunks.push(Buffer.from(CRLF));
+  }
+  chunks.push(Buffer.from(`--${boundary}--${CRLF}`));
+  const body = Buffer.concat(chunks);
+  return {
+    body,
+    headers: {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': String(body.length),
+    },
+  };
+}
 
 // Global `fetch` and `FormData` are available on Node 18+, Cloudflare Workers,
 // Netlify Functions, Vercel Edge/Node, and browsers. We use them directly
@@ -207,14 +241,15 @@ async function uploadToLitterbox(buffer, filename, mime, { dispatcher, socksAgen
   const endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
 
   if (socksAgent) {
-    const fd = new NodeFormData();
-    fd.append('reqtype', 'fileupload');
-    fd.append('time', '1h');
-    fd.append('fileToUpload', buffer, { filename, contentType: mime || 'application/octet-stream' });
+    const { body, headers: mpHeaders } = buildMultipart([
+      { name: 'reqtype', value: 'fileupload' },
+      { name: 'time', value: '1h' },
+      { name: 'fileToUpload', value: buffer, filename, contentType: mime || 'application/octet-stream' },
+    ]);
     const r = await httpsRequestViaSocks(endpoint, {
       method: 'POST',
-      headers: { 'User-Agent': UA, Accept: 'text/plain', ...fd.getHeaders() },
-      body: fd,
+      headers: { 'User-Agent': UA, Accept: 'text/plain', ...mpHeaders },
+      body,
       agent: socksAgent,
     });
     const text = await r.text();
@@ -249,12 +284,13 @@ async function uploadToTmpfile(buffer, filename, mime, { dispatcher, socksAgent 
   const endpoint = 'https://tmpfile.link/api/upload';
 
   if (socksAgent) {
-    const fd = new NodeFormData();
-    fd.append('file', buffer, { filename, contentType: mime || 'application/octet-stream' });
+    const { body, headers: mpHeaders } = buildMultipart([
+      { name: 'file', value: buffer, filename, contentType: mime || 'application/octet-stream' },
+    ]);
     const r = await httpsRequestViaSocks(endpoint, {
       method: 'POST',
-      headers: { 'User-Agent': UA, Accept: 'application/json', ...fd.getHeaders() },
-      body: fd,
+      headers: { 'User-Agent': UA, Accept: 'application/json', ...mpHeaders },
+      body,
       agent: socksAgent,
     });
     const text = await r.text();
