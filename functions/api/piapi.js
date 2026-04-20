@@ -109,10 +109,42 @@ function makeRes() {
   };
 }
 
+// Pre-parse multipart/form-data using the Web `Request.formData()` API so we
+// never hit `formidable` on the Workers runtime (formidable requires
+// `fs.createWriteStream` for temp files, which Workers does not support even
+// with `nodejs_compat_v2`). Result is attached to `req.__preparsedBody__` and
+// `api/piapi.js` short-circuits `parseRequestBody` when that marker is set.
+async function maybePreparseMultipart(request, req) {
+  const ct = (request.headers.get('content-type') || '').toLowerCase();
+  if (!ct.startsWith('multipart/form-data')) return;
+
+  const fd = await request.formData();
+  const fields = {};
+  const files = {};
+  for (const [key, value] of fd.entries()) {
+    // Duck-type check — File/Blob both expose arrayBuffer() and a name/type.
+    if (value && typeof value.arrayBuffer === 'function') {
+      const buf = Buffer.from(await value.arrayBuffer());
+      files[key] = {
+        buffer: buf,
+        size: buf.length,
+        originalFilename: value.name || 'upload.bin',
+        newFilename: value.name || 'upload.bin',
+        mimetype: value.type || 'application/octet-stream',
+        filepath: null, // no disk file on Workers
+      };
+    } else {
+      fields[key] = String(value);
+    }
+  }
+  req.__preparsedBody__ = { fields, files, isFormData: true };
+}
+
 export const onRequest = async ({ request }) => {
   try {
     const url = new URL(request.url);
     const req = makeReq(request, url);
+    await maybePreparseMultipart(request, req);
     const { res, toResponse } = makeRes();
     // Kick off handler; it will call res.end/json/send when done.
     const p = piapiHandler(req, res);

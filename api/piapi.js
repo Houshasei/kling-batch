@@ -54,6 +54,10 @@ async function readAsJsonOrText(response) {
 }
 
 async function parseRequestBody(req) {
+  // If an adapter (e.g. Cloudflare Pages Functions) already parsed the body
+  // using a runtime-appropriate API, use that instead of touching formidable.
+  if (req.__preparsedBody__) return req.__preparsedBody__;
+
   const contentType = req.headers['content-type'] || '';
 
   if (contentType.includes('multipart/form-data')) {
@@ -416,11 +420,14 @@ export default async function handler(req, res) {
       const chosenHost = (host || 'litterbox').toLowerCase();
       const hostDef = HOSTS[chosenHost];
       if (!hostDef) {
-        try { await fs.promises.unlink(file.filepath); } catch (_) {}
+        if (file.filepath) { try { await fs.promises.unlink(file.filepath); } catch (_) {} }
         return res.status(400).json({ error: `Unknown host: ${chosenHost}` });
       }
 
-      const buffer = await fs.promises.readFile(file.filepath);
+      // Prefer an in-memory buffer (provided by adapters on runtimes with no
+      // writable FS, e.g. Cloudflare Workers). Fall back to reading the temp
+      // file that formidable wrote on Node-capable hosts.
+      const buffer = file.buffer || await fs.promises.readFile(file.filepath);
       const fileName = file.originalFilename || file.newFilename || 'upload.bin';
       const mime = file.mimetype || 'application/octet-stream';
 
@@ -429,7 +436,7 @@ export default async function handler(req, res) {
         try {
           proxy = await prepProxy(proxyUrl);
         } catch (err) {
-          try { await fs.promises.unlink(file.filepath); } catch (_) {}
+          if (file.filepath) { try { await fs.promises.unlink(file.filepath); } catch (_) {} }
           return res.status(400).json({ error: `Invalid proxy URL: ${err.message}`, proxyFailed: true, code: err.code });
         }
       }
@@ -464,7 +471,7 @@ export default async function handler(req, res) {
         });
       } finally {
         closeProxy(proxy);
-        try { await fs.promises.unlink(file.filepath); } catch (_) {}
+        if (file.filepath) { try { await fs.promises.unlink(file.filepath); } catch (_) {} }
       }
     }
 
