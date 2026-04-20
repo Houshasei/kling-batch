@@ -82,6 +82,9 @@ function localApiBridge() {
   }
 }
 
+// `BASE_PATH` lets GitHub Pages repo-subpath builds work, e.g. /kling-batch/.
+// Leave unset for root-hosted deploys (Vercel/Netlify/Cloudflare/Replit/Render).
 export default defineConfig({
+  base: process.env.BASE_PATH || '/',
   plugins: [react(), localApiBridge()],
 })

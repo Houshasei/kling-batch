@@ -24,6 +24,10 @@ const STORAGE_PROXY_PROTOCOL = "kling_batch_proxy_protocol";
 const MAX_PROXY_REROLLS = 5;
 const PROXY_PROTOCOLS = ["http", "socks5"];
 
+// API base URL — defaults to same-origin /api/piapi. Override with VITE_API_BASE at build time
+// for static-only hosts like GitHub Pages that need to point at an external backend.
+const API_BASE = (import.meta.env?.VITE_API_BASE?.replace(/\/+$/, "") || "") + "/api/piapi";
+
 const font = `'DM Sans', sans-serif`;
 const mono = `'JetBrains Mono', 'Fira Code', monospace`;
 
@@ -422,7 +426,7 @@ export default function App() {
     const payload = needsApiKey ? { apiKey, ...body } : body;
     let r;
     try {
-      r = await fetch("/api/piapi", {
+      r = await fetch(API_BASE, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -465,7 +469,7 @@ export default function App() {
 
     let r;
     try {
-      r = await fetch("/api/piapi", { method: "POST", body: fd });
+      r = await fetch(API_BASE, { method: "POST", body: fd });
     } catch (err) {
       const e = new Error(`Network error during upload: ${err.message}`);
       e.proxyFailed = Boolean(proxyUrl);
@@ -976,7 +980,7 @@ export default function App() {
   const spent = completedCount * perVideo;
 
   const safeDownloadName = (job) => `${safeBase(job.imageName)}.mp4`;
-  const proxyDownload = (job) => `/api/piapi?action=download_proxy&url=${encodeURIComponent(job.videoUrl)}&filename=${encodeURIComponent(safeDownloadName(job))}`;
+  const proxyDownload = (job) => `${API_BASE}?action=download_proxy&url=${encodeURIComponent(job.videoUrl)}&filename=${encodeURIComponent(safeDownloadName(job))}`;
 
   async function downloadAllZip() {
     if (zipProgress.phase !== "idle" && zipProgress.phase !== "done") return;

@@ -1,0 +1,15 @@
+# Cloudflare Pages config.
+#
+# Build settings in CF dashboard:
+#   Build command:   npm run build
+#   Output dir:      dist
+#
+# In Settings → Functions → Compatibility flags, add: nodejs_compat_v2
+# Without this flag, the SOCKS5 proxy feature will not work (and neither
+# will formidable/undici). HTTP proxy mode may still work without the flag
+# if undici can fall back to global fetch.
+
+name = "kling-batch"
+compatibility_date = "2024-11-06"
+compatibility_flags = ["nodejs_compat_v2"]
+pages_build_output_dir = "dist"
