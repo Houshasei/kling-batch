@@ -25,7 +25,7 @@ const MAX_PROXY_REROLLS = 5;
 const PROXY_PROTOCOLS = ["http", "socks5"];
 
 // API base URL — defaults to same-origin /api/piapi. Override with VITE_API_BASE at build time
-// for static-only hosts like GitHub Pages that need to point at an external backend.
+// when the SPA and backend live on different origins.
 const API_BASE = (import.meta.env?.VITE_API_BASE?.replace(/\/+$/, "") || "") + "/api/piapi";
 
 const font = `'DM Sans', sans-serif`;

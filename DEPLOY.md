@@ -1,8 +1,8 @@
 # Deployment Guide
 
-Kling Batch works on every major host. The backend handler in `api/piapi.js`
-is a **Node.js serverless function** — so any host that runs Node works
-out of the box. Static-only hosts (GitHub Pages) need an external backend.
+Kling Batch works on every major Node-capable host. The backend handler in
+`api/piapi.js` is a **Node.js serverless function**, so any host that runs
+Node works out of the box.
 
 ## Quick compatibility matrix
 
@@ -10,9 +10,8 @@ out of the box. Static-only hosts (GitHub Pages) need an external backend.
 |------|-----|---------|----------------|-------------------|--------------|
 | **Vercel** | ✅ | ✅ native | ✅ | ✅ | `api/piapi.js` (already set) |
 | **Netlify** | ✅ | ✅ Functions | ✅ | ✅ | `netlify.toml`, `netlify/functions/piapi.js` |
-| **Cloudflare Pages** | ✅ | ⚠️ requires flag | ✅ | ⚠️ runtime-dependent | `wrangler.toml`, `functions/api/piapi.js` |
+| **Cloudflare Pages** | ✅ | ⚠️ requires flag | ❌ disabled | ⚠️ runtime-dependent | `wrangler.toml`, `functions/api/piapi.js` |
 | **Replit / Render / Railway / Fly / Docker / VPS** | ✅ | ✅ Express | ✅ | ✅ | `server.js`, `.replit` |
-| **GitHub Pages** | ✅ | ❌ static only | n/a (external) | n/a (external) | `.github/workflows/gh-pages.yml` |
 
 ---
 
@@ -81,39 +80,6 @@ npm start          # PORT=3000 by default
 
 ---
 
-## GitHub Pages (static SPA + external backend)
-
-GitHub Pages cannot run Node, so the SPA must call a backend deployed
-elsewhere (Vercel / Netlify / Replit / etc.).
-
-### Setup
-
-1. Deploy the backend first. Easiest: 1-click Vercel.
-2. In your GitHub repo → **Settings → Secrets and variables → Actions**
-   add a secret named `VITE_API_BASE` with the root URL of your backend,
-   e.g. `https://my-kling.vercel.app` (no trailing slash, no `/api`).
-3. Enable **Pages** in repo settings (source: GitHub Actions).
-4. Push to `main`. The workflow at `.github/workflows/gh-pages.yml` will:
-   - Build with `BASE_PATH=/<repo-name>/` so asset URLs resolve.
-   - Inject `VITE_API_BASE` into the build so fetches hit your backend.
-   - Publish `dist/` to Pages.
-
-### Backend CORS note
-
-If the SPA is on `*.github.io` and the backend is on `*.vercel.app`,
-you may need to allow cross-origin requests. The current backend does
-not set CORS headers. Add this to `api/piapi.js` if you hit CORS errors:
-
-```js
-res.setHeader('Access-Control-Allow-Origin', '*');
-res.setHeader('Access-Control-Allow-Headers', 'content-type');
-if (req.method === 'OPTIONS') { res.status(204).end(); return; }
-```
-
-(Place this at the top of the `handler` function.)
-
----
-
 ## Local development
 
 ```bash
@@ -130,8 +96,8 @@ plugin in `vite.config.js` — no separate backend process needed.
 
 | Name | Used at | Purpose |
 |------|---------|---------|
-| `VITE_API_BASE` | build time | Override same-origin `/api/piapi` (only needed for GitHub Pages) |
-| `BASE_PATH` | build time | Asset base path; default `/`, set to `/repo-name/` for GH Pages |
+| `VITE_API_BASE` | build time | Override same-origin `/api/piapi` (only needed if SPA and backend live on different origins) |
+| `BASE_PATH` | build time | Asset base path; default `/`, set to `/subpath/` for subpath-hosted deploys |
 | `PORT` | runtime (server.js) | TCP port, default `3000` |
 | `HOST` | runtime (server.js) | Bind address, default `0.0.0.0` |
 
