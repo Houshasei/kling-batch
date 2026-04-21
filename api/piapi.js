@@ -66,11 +66,9 @@ export const config = {
 };
 
 const UA = 'kling-batch/1.0 (+https://github.com/Houshasei/kling-batch)';
-const API_KEY_ACTIONS = new Set(['create', 'poll', 'account_info', 'active_tasks', 'task_history']);
+const API_KEY_ACTIONS = new Set(['create', 'poll', 'account_info']);
 const ACCOUNT_ACTION_URLS = {
   account_info: 'https://api.piapi.ai/account/info',
-  active_tasks: 'https://api.piapi.ai/account/active_tasks',
-  task_history: 'https://api.piapi.ai/api/open/tasks/histories?page=1&page_size=100&model=kling',
 };
 
 async function readAsJsonOrText(response) {

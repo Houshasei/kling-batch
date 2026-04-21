@@ -8,11 +8,7 @@ import JSZip from "jszip";
 
 const JOB_POLL_TICK_INTERVAL = 3000;
 const JOB_POLL_MIN_INTERVAL = 15000;
-const ACCOUNT_MONITOR_TICK_INTERVAL = 30000;
-const ACCOUNT_ACTIVE_INTERVAL = 30000;
 const ACCOUNT_INFO_INTERVAL = 60000;
-const ACCOUNT_HISTORY_INTERVAL = 120000;
-const ACCOUNT_REQUEST_GAP_MS = 2000;
 const MAX_AUTO_RETRIES = 1000;
 const UPLOAD_PROPAGATION_MS = 2000;
 const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
@@ -115,10 +111,6 @@ function formatBytes(n) {
   return `${(n / 1024 / 1024).toFixed(2)}MB`;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function isPlainObject(v) {
   return Boolean(v) && typeof v === "object" && !Array.isArray(v);
 }
@@ -151,100 +143,6 @@ function formatUsd(value) {
     });
   }
   return value === undefined || value === null || value === "" ? "--" : `$${value}`;
-}
-
-function asTaskObject(task) {
-  return isPlainObject(task) ? task : { task_id: String(task || "") };
-}
-
-function normalizeTaskArray(payload) {
-  const data = payload?.data;
-  const sources = [
-    data,
-    data?.tasks,
-    data?.items,
-    payload?.tasks,
-    payload?.items,
-    payload?.results,
-    payload?.list,
-    data?.results,
-    data?.list,
-  ];
-  const list = sources.find((source) => Array.isArray(source)) || [];
-  return list.map(asTaskObject);
-}
-
-function filterKlingTasks(tasks) {
-  return tasks.filter((task) => {
-    const model = pickFirst(task, ["model"]);
-    return !model || String(model).toLowerCase().includes("kling");
-  });
-}
-
-function shortTaskId(task) {
-  const id = String(pickFirst(task, ["task_id", "taskId", "id"]) || "");
-  if (!id) return "--";
-  if (id.length <= 14) return id;
-  return `${id.slice(0, 8)}...${id.slice(-4)}`;
-}
-
-function formatCompactNumber(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return String(value);
-  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(n);
-}
-
-function formatTaskTime(value) {
-  if (value === undefined || value === null || value === "") return "";
-  const raw = typeof value === "number"
-    ? new Date(value < 100000000000 ? value * 1000 : value)
-    : new Date(value);
-  if (!Number.isFinite(raw.getTime()) || raw.getFullYear() <= 1971) return "";
-  return raw.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function taskTimeParts(task) {
-  return [
-    ["C", pickFirst(task, ["meta.created_at", "created_at", "createdAt", "created_time", "created"])],
-    ["S", pickFirst(task, ["meta.started_at", "started_at", "startedAt", "started_time", "started"])],
-    ["E", pickFirst(task, ["meta.ended_at", "ended_at", "endedAt", "ended_time", "ended"])],
-  ]
-    .map(([label, value]) => {
-      const formatted = formatTaskTime(value);
-      return formatted ? `${label} ${formatted}` : "";
-    })
-    .filter(Boolean);
-}
-
-function taskUsageText(task) {
-  const parts = [];
-  const consume = pickFirst(task, ["meta.usage.consume", "usage.consume", "consume"]);
-  const frozen = pickFirst(task, ["meta.usage.frozen", "usage.frozen", "frozen"]);
-  if (consume !== null) parts.push(`consume ${formatCompactNumber(consume)}`);
-  if (frozen !== null) parts.push(`frozen ${formatCompactNumber(frozen)}`);
-  return parts.join(" / ");
-}
-
-function taskErrorText(task) {
-  const status = String(pickFirst(task, ["status"]) || "").toLowerCase();
-  const paths = ["error.message", "error.raw_message", "raw_message"];
-  if (status.includes("fail") || status.includes("error")) paths.push("message", "detail");
-  const err = pickFirst(task, paths);
-  return typeof err === "string" ? err : "";
-}
-
-function taskStatusColor(status) {
-  const s = String(status || "").toLowerCase();
-  if (s.includes("complete") || s === "success" || s === "succeeded") return c.success;
-  if (s.includes("fail") || s.includes("error")) return c.error;
-  if (s.includes("pending") || s.includes("queue")) return c.warn;
-  if (s.includes("process") || s.includes("running") || s.includes("progress")) return c.accent;
-  return c.muted;
 }
 
 // =======================================================================
@@ -464,66 +362,7 @@ function ZipButton({ count, progress, onClick }) {
   );
 }
 
-function TaskMiniRow({ task }) {
-  const status = String(pickFirst(task, ["status"]) || "unknown");
-  const type = String(pickFirst(task, ["task_type", "taskType", "type"]) || "task");
-  const model = pickFirst(task, ["model"]);
-  const usage = taskUsageText(task);
-  const err = taskErrorText(task);
-  const times = taskTimeParts(task);
-  const color = taskStatusColor(status);
-
-  return (
-    <div style={{ padding: "7px 0", borderTop: `1px solid ${c.border}` }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", marginBottom: 3 }}>
-        <span title={String(pickFirst(task, ["task_id", "taskId", "id"]) || "")} style={{ fontSize: 10, fontFamily: mono, color: c.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {shortTaskId(task)}
-        </span>
-        <span style={{ fontSize: 9, fontFamily: mono, color, textTransform: "uppercase", letterSpacing: "0.06em", whiteSpace: "nowrap" }}>
-          {truncate(status, 18)}
-        </span>
-      </div>
-      <div style={{ fontSize: 10, color: c.muted, lineHeight: 1.35, wordBreak: "break-word" }}>
-        {truncate(type, 46)}{model ? <span style={{ color: c.hint }}> / {truncate(model, 32)}</span> : null}
-      </div>
-      {times.length > 0 && (
-        <div style={{ fontSize: 9, color: c.hint, fontFamily: mono, lineHeight: 1.45, marginTop: 3 }}>
-          {times.join(" | ")}
-        </div>
-      )}
-      {usage && (
-        <div style={{ fontSize: 9, color: c.hint, fontFamily: mono, lineHeight: 1.45, marginTop: 2 }}>
-          {usage}
-        </div>
-      )}
-      {err && (
-        <div style={{ fontSize: 9, color: c.error, lineHeight: 1.35, marginTop: 3, wordBreak: "break-word" }}>
-          {truncate(err, 110)}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TaskMiniList({ title, tasks, emptyText, maxHeight }) {
-  return (
-    <div style={{ borderTop: `1px solid ${c.border}`, paddingTop: 9 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
-        <div style={{ fontSize: 10, color: c.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em" }}>{title}</div>
-        <div style={{ fontSize: 10, color: c.hint, fontFamily: mono }}>{tasks.length}</div>
-      </div>
-      <div style={{ maxHeight, overflowY: "auto", paddingRight: 4 }}>
-        {tasks.length === 0 ? (
-          <div style={{ fontSize: 10, color: c.hint, lineHeight: 1.45 }}>{emptyText}</div>
-        ) : (
-          tasks.map((task, i) => <TaskMiniRow key={`${shortTaskId(task)}-${i}`} task={task} />)
-        )}
-      </div>
-    </div>
-  );
-}
-
-function AccountMonitor({ connected, accountInfo, activeTasks, historyTasks, loading, error, lastRefresh }) {
+function AccountMonitor({ connected, accountInfo, loading, error, lastRefresh }) {
   if (!connected) return null;
 
   const balance = pickFirst(accountInfo || {}, ["equivalent_in_usd", "equivalentInUsd", "balance_usd", "usd"]);
@@ -558,9 +397,6 @@ function AccountMonitor({ connected, accountInfo, activeTasks, historyTasks, loa
           {truncate(error, 170)}
         </div>
       )}
-
-      <TaskMiniList title="Active Kling tasks" tasks={activeTasks} emptyText="No active Kling tasks." maxHeight={118} />
-      <TaskMiniList title="Kling history" tasks={historyTasks} emptyText="No Kling history yet." maxHeight={170} />
     </div>
   );
 }
@@ -609,8 +445,6 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [zipProgress, setZipProgress] = useState({ phase: "idle", done: 0, total: 0, percent: 0 });
   const [accountInfo, setAccountInfo] = useState(null);
-  const [accountActiveTasks, setAccountActiveTasks] = useState([]);
-  const [accountHistoryTasks, setAccountHistoryTasks] = useState([]);
   const [accountLoading, setAccountLoading] = useState(false);
   const [accountError, setAccountError] = useState("");
   const [accountLastRefresh, setAccountLastRefresh] = useState(null);
@@ -629,7 +463,6 @@ export default function App() {
   const imageDragCounter = useRef(0);
   const accountRefreshInFlightRef = useRef(false);
   const accountMountedRef = useRef(true);
-  const accountRefreshTimesRef = useRef({ info: 0, active: 0, history: 0 });
 
   const rate = mode === "std" ? 0.065 : 0.104;
   const perVideo = rate * videoDuration;
@@ -701,7 +534,7 @@ export default function App() {
 
   async function proxyJson(body) {
     const action = body?.action;
-    const needsApiKey = ["create", "poll", "account_info", "active_tasks", "task_history"].includes(action);
+    const needsApiKey = ["create", "poll", "account_info"].includes(action);
     const payload = needsApiKey ? { apiKey, ...body } : body;
     let r;
     try {
@@ -731,63 +564,20 @@ export default function App() {
     return json ?? {};
   }
 
-  const refreshAccountMonitor = useCallback(async ({ force = false } = {}) => {
+  const refreshAccountMonitor = useCallback(async () => {
     if (!connected || !apiKey || accountRefreshInFlightRef.current) return;
-    const startedAt = Date.now();
-    const last = accountRefreshTimesRef.current;
-    const steps = [
-      {
-        key: "active",
-        label: "active tasks",
-        due: force || startedAt - last.active >= ACCOUNT_ACTIVE_INTERVAL,
-        action: "active_tasks",
-        apply: (resp) => setAccountActiveTasks(filterKlingTasks(normalizeTaskArray(resp))),
-      },
-      {
-        key: "info",
-        label: "balance",
-        due: force || startedAt - last.info >= ACCOUNT_INFO_INTERVAL,
-        action: "account_info",
-        apply: (resp) => setAccountInfo(normalizeAccountInfo(resp)),
-      },
-      {
-        key: "history",
-        label: "history",
-        due: force || startedAt - last.history >= ACCOUNT_HISTORY_INTERVAL,
-        action: "task_history",
-        apply: (resp) => setAccountHistoryTasks(filterKlingTasks(normalizeTaskArray(resp)).slice(0, 100)),
-      },
-    ].filter((step) => step.due);
-
-    if (steps.length === 0) return;
     accountRefreshInFlightRef.current = true;
     setAccountLoading(true);
 
-    const errors = [];
     try {
+      const resp = await proxyJson({ action: "account_info" });
+      if (!accountMountedRef.current) return;
+      setAccountInfo(normalizeAccountInfo(resp));
+      setAccountLastRefresh(new Date());
+      setAccountError("");
+    } catch (err) {
       if (accountMountedRef.current) {
-        setAccountLastRefresh(new Date());
-      }
-
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        try {
-          const resp = await proxyJson({ action: step.action });
-          if (!accountMountedRef.current) return;
-          step.apply(resp);
-          accountRefreshTimesRef.current[step.key] = Date.now();
-        } catch (err) {
-          accountRefreshTimesRef.current[step.key] = Date.now();
-          errors.push(`${step.label}: ${err?.message || "refresh failed"}`);
-        }
-
-        if (i < steps.length - 1) {
-          await sleep(ACCOUNT_REQUEST_GAP_MS);
-        }
-      }
-
-      if (accountMountedRef.current) {
-        setAccountError(errors.join(" | "));
+        setAccountError(err?.message || "PiAPI balance refresh failed");
       }
     } finally {
       accountRefreshInFlightRef.current = false;
@@ -798,16 +588,13 @@ export default function App() {
   useEffect(() => {
     if (!connected || !apiKey) {
       setAccountInfo(null);
-      setAccountActiveTasks([]);
-      setAccountHistoryTasks([]);
       setAccountError("");
       setAccountLoading(false);
       return undefined;
     }
 
-    accountRefreshTimesRef.current = { info: 0, active: 0, history: 0 };
-    refreshAccountMonitor({ force: true });
-    const id = setInterval(refreshAccountMonitor, ACCOUNT_MONITOR_TICK_INTERVAL);
+    refreshAccountMonitor();
+    const id = setInterval(refreshAccountMonitor, ACCOUNT_INFO_INTERVAL);
     return () => clearInterval(id);
   }, [apiKey, connected, refreshAccountMonitor]);
 
@@ -1547,8 +1334,6 @@ export default function App() {
           <AccountMonitor
             connected={connected}
             accountInfo={accountInfo}
-            activeTasks={accountActiveTasks}
-            historyTasks={accountHistoryTasks}
             loading={accountLoading}
             error={accountError}
             lastRefresh={accountLastRefresh}
